@@ -1,257 +1,149 @@
 # Slideshow Web Server
 
-A .NET slideshow web application that can be configured to display images and videos in a web browser. It supports both standalone execution and installation as a Windows service.
+A self-contained .NET 9 web application that displays images and videos in a browser from a local directory or SMB share, mirrored into a local disk cache so network hiccups never stall playback.
+
+- [Features](#features)
+- [Configuration](#configuration)
+- [Running the Application](#running-the-application)
+- [Windows Service Installation](#windows-service-installation)
+- [Linux Systemd Installation](#linux-systemd-installation)
+- [Security and Service Account Configuration](#security-and-service-account-configuration)
 
 ## Features
 
-- **Media File Support**: Supports images (JPG, PNG, GIF, WebP, BMP, SVG) and videos (MP4, WebM, OGG, AVI, MOV)
-- **Configuration**: JSON-based configuration for slideshow behavior
-- **Windows Service**: Can be installed and run as a Windows service
-- **Single File Deployment**: Self-contained executable with all dependencies
+- **Media File Support**: Images (JPG, JPEG, PNG, GIF, WebP, BMP, SVG) and videos (MP4, WebM, OGG, AVI, MOV).
+- **Resilient Local Cache**: Mirrors remote SMB or local source files to a local cache directory using atomic renames, serving all HTTP traffic from local disk.
+- **Self-Healing Kiosk UI**: Retries startup fetches with backoff, refreshes the playlist in the background, and skips stalled media automatically.
+- **Service Integration**: Native Windows Service (`UseWindowsService`) and Linux systemd (`UseSystemd`, `Type=notify`) support.
+- **Single-File Deployment**: Trimmed, self-contained executable with embedded web assets.
 
 ## Configuration
 
-The application searches for `config.json` in the following order:
-1. Same directory as the executable
+The server searches for `config.json` in the following order:
+
+1. Same directory as the executable (`AppContext.BaseDirectory`)
 2. Current working directory
 
-Edit the `config.json`
+Relative paths in `config.json` resolve relative to `AppContext.BaseDirectory`.
 
 ```json
 {
   "imageDuration": 5,
-  "folderPath": "C:\\Path\\To\\Your\\Media\\Files",
+  "folderPath": "./media",
+  "syncIntervalSeconds": 60,
   "fadeTransitionDuration": 1,
   "zoomOnImage": true,
   "displayOrder": "Alpha"
 }
 ```
-- `imageDuration`: How long to display each image (in seconds)
-- `folderPath`: Full path to the folder containing your media files
-- `fadeTransitionDuration`: Duration of fade transition between images/videos (in seconds)
-- `zoomOnImage`: Whether to apply subtle zoom animation to images
-- `displayOrder`: Order to display media files - `"Alpha"` for alphabetical, `"Random"` for random order
 
-### Command Line Options
+- `imageDuration`: Seconds to display each image (minimum `1`).
+- `folderPath`: Source folder containing media files (local folder or mounted SMB share).
+- `cacheFolderPath`: Optional local directory used to cache mirrored media. Defaults to systemd's `CACHE_DIRECTORY` (`/var/cache/slideshow`) when set, or `./cache` beside the executable.
+- `syncIntervalSeconds`: Polling interval in seconds for syncing `folderPath` into `cacheFolderPath` (minimum `5`, default `60`).
+- `fadeTransitionDuration`: Cross-fade duration in seconds between slides (`0` or greater).
+- `zoomOnImage`: Enables a subtle zoom animation on images.
+- `displayOrder`: `"Alpha"` for alphabetical order or `"Random"` for shuffled playback.
+- `allowEmptySourceSync`: Optional boolean (default `false`). When `false`, an empty source directory does not delete existing cached slides so an unmounted share cannot wipe playback.
 
-The application supports various command line arguments for configuration:
+### Command Line and Environment Overrides
 
-You can change the URLs and ports the server listens on using the `--Urls` parameter:
+Configuration precedence runs from lowest to highest: built-in defaults, `config.json`, environment variables, command-line arguments.
+
+By default, the server listens only on `http://localhost:5500`. Pass `--urls` (or set `ASPNETCORE_URLS`) to change ports or listen on LAN interfaces:
 
 ```batch
-# Listen on a different port
+# Listen on localhost with a custom port
 SlideshowWebServer.exe --urls "http://localhost:8080"
 
-# Listen on all interfaces on port 5500 (default)
+# Listen on all network interfaces on port 5500
 SlideshowWebServer.exe --urls "http://*:5500"
 
-# Listen on specific IP address
+# Listen on a specific IP address
 SlideshowWebServer.exe --urls "http://192.168.1.100:5500"
 
-# Listen on multiple URLs
-SlideshowWebServer.exe --urls "http://localhost:5500;https://localhost:5501"
-
-# Listen on all interfaces with a custom port
-SlideshowWebServer.exe --urls "http://*:3000"
-```
-
-You can override any configuration setting using command line arguments:
-
-```batch
-# Override logging level
-SlideshowWebServer.exe --Logging:LogLevel:Default=Debug
-
-# Combine URL and logging configuration
-SlideshowWebServer.exe --urls "http://*:8080" --Logging:LogLevel:Default=Debug
+# Override slideshow and logging settings from the command line
+SlideshowWebServer.exe --folderPath "D:\Photos" --imageDuration 8 --Logging:LogLevel:Default=Debug
 ```
 
 ## Running the Application
 
 ### Logging
 
-When running as a standalone application, logs are written to the console.
-
-When running as a Windows service, logs are written to the Windows Event Log under "Application".
+Standalone runs log to the console. Windows service runs also log to the Windows Event Log under `Application` (`SlideshowService`).
 
 ### Security Notes
 
-- The application includes path traversal protection to prevent access to files outside the configured media folder
-- Only files with supported extensions are served
-- The server listens on HTTP (default port 5500) - use a reverse proxy like IIS or nginx for HTTPS in production
-- When changing URLs via command line, ensure the new ports don't conflict with other services
+- The server binds to `http://localhost:5500` by default so kiosk deployments do not expose media on the local network unless `--urls` or `ASPNETCORE_URLS` opts in.
+- Media requests validate filenames against the cache directory, reject symlinks and path separators, set `X-Content-Type-Options: nosniff`, and sandbox SVG responses with a strict `Content-Security-Policy`.
+- `/api/config` and `/api/files` return only playback metadata and never expose server filesystem paths.
+- Use a reverse proxy such as nginx, Caddy, or IIS to terminate TLS when serving over a network.
 
 ### Standalone Application
 
-Navigate to the `dist` folder and run the appropriate executable for your platform:
+Run the published executable from `./dist`:
 
 #### Windows (x64)
 ```batch
 SlideshowWebServer.exe
 ```
 
-#### Linux (x64), macOS (Intel x64, Apple Silicon ARM)
+#### Linux (x64, ARM64) and macOS (x64, ARM64)
 ```bash
+chmod +x SlideshowWebServer
 ./SlideshowWebServer
 ```
 
-**Note**: On macOS and Linux, you may need to make the executable file executable first:
+### Publishing and Testing from Source
+
+Run the unit and integration test suite:
+
 ```bash
-chmod +x SlideshowWebServer
+dotnet test source/Slideshow.sln
 ```
 
-### Publishing from Source
+Build a self-contained single-file binary into `./dist` using the platform script:
 
-To build the application for different platforms, use the provided build scripts:
-
-#### Windows Build
-```batch
-buildwin.bat
-```
-
-#### Linux x64 Build
-```bash
-./buildlinuxx64.sh
-```
-
-#### macOS Intel x64 Build
-```bash
-./buildmacx64.sh
-```
-
-#### macOS Apple Silicon ARM Build
-```bash
-./buildmacarm.sh
-```
-
-All builds will output to the `./dist` folder as a self-contained executable with all dependencies included.
-
-The server will start on http://localhost:5500/ by default.
-
+- Windows x64: `buildwin.bat`
+- Linux x64: `./buildlinuxx64.sh`
+- Linux ARM64: `./buildlinuxarm.sh`
+- macOS Intel x64: `./buildmacx64.sh`
+- macOS Apple Silicon ARM64: `./buildmacarm.sh`
 
 ## Windows Service Installation
 
-**Important: Run as Administrator**
+Run as Administrator from `dist\win32`:
 
-All service management commands must be run as Administrator from the `dist\win32` folder:
-
-### Install Service
 ```batch
 install-service.bat
 ```
 
-The install script will:
-- Create Windows Event Log sources for proper logging
-- Create the service with the name "SlideshowService" and display name "Slideshow Web Server"
-- Set the service to start automatically on system boot
-- Start the service immediately after creation
+The installer creates the `SlideshowService` Windows Event Log source, registers `SlideshowService` (`Slideshow Web Server`) for automatic startup, and starts the service.
 
-**Service Details:**
-- **Service Name**: SlideshowService
-- **Display Name**: Slideshow Web Server
-- **Description**: Web-based slideshow application that displays images and videos from a configured folder. Accessible via web browser.
-- **Start Type**: Automatic
-- **Run As**: Local System (for broad file system access)
+To uninstall:
 
-### Uninstall Service
 ```batch
 uninstall-service.bat
 ```
 
+## Linux Systemd Installation
+
+Linux release archives include `linux/slideshow.service` (`DynamicUser=yes` with `CacheDirectory=slideshow`), `linux/kiosk.service`, `linux/auto.smb`, and `linux/credential.txt`. Full Ubuntu Frame kiosk and CIFS automount setup steps are in `source/linux/ubuntu-kiosk-configuration.md`.
+
 ## Security and Service Account Configuration
 
-### Default Service Account
+### Default Windows Service Account
 
-By default, the Windows service runs as **Local System**, which provides broad access to the file system and eliminates most media folder access issues. This account can access:
-- All local drives and folders
-- Network resources (if the computer account has permissions)
-- User profile folders (Documents, Pictures, etc.)
+`install-service.bat` configures `SlideshowService` to run as `LocalSystem` for broad local disk compatibility on dedicated kiosk hardware.
 
-### When to Change the Service Account
+Switch to a lower-privilege account (`NT AUTHORITY\NetworkService` or a dedicated local/domain service account) on shared machines or corporate networks:
 
-While Local System provides the best compatibility, you may want to use a more restrictive account in security-sensitive environments:
+1. Open `services.msc`, right-click **Slideshow Web Server**, and open **Properties > Log On**.
+2. Select **This account** and enter `NT AUTHORITY\NetworkService` or a dedicated account that has read access to `folderPath` and read/write access to `cacheFolderPath`.
+3. Use UNC paths (`\\server\share\folder`) instead of per-user mapped drive letters.
+4. Restart the service:
 
-**Consider changing the service account if:**
-- The system handles sensitive data or is on a corporate network
-- You need to comply with security policies that require least-privilege service accounts
-- The slideshow will only access a specific folder that can be secured for a dedicated account
-
-### Security Considerations
-
-**Local System Account (Default):**
-- **Pros:** Maximum compatibility, can access any local folder or network resource
-- **Cons:** Has full administrative privileges on the system
-- **Best for:** Dedicated kiosk machines, home media servers, isolated display systems
-
-**NetworkService Account:**
-- **Pros:** More secure, limited system privileges
-- **Cons:** May not access user folders, network drives, or mapped drives without additional configuration
-- **Best for:** Corporate environments, systems with strict security requirements
-
-**Dedicated Service Account:**
-- **Pros:** Can be granted only the specific permissions needed
-- **Cons:** Requires manual setup and permission management
-- **Best for:** Enterprise deployments with specific security policies
-
-**General Security Tips:**
-- Use Local System on dedicated/isolated systems where convenience matters most
-- Use NetworkService or dedicated accounts in corporate/shared environments
-- Ensure the media folder has appropriate access controls regardless of service account
-- Consider network-level security (firewall rules) to limit access to the web interface
-
-### How to Change Service Account
-
-1. **Open Services Management:**
-   - Press `Win + R`, type `services.msc`, and press Enter
-   - Or search for "Services" in the Start menu
-
-2. **Find and Configure the Service:**
-   - Locate "Slideshow Web Server" in the services list
-   - Right-click on it and select "Properties"
-   - Go to the "Log On" tab
-
-3. **Change the User Account:**
-   - Current default is "Local System account"
-   - To use a more restrictive account, select "This account"
-   - **For NetworkService:** Enter `NT AUTHORITY\NetworkService` (no password required)
-   - **For dedicated service account:** Use `DOMAIN\ServiceAccount` or `.\LocalAccount`
-   - **For specific user:** Use `DOMAIN\Username` or `COMPUTERNAME\Username`
-   - Enter the password if required
-   - Click "OK"
-
-4. **Restart the Service:**
-   - In the Services console, right-click "Slideshow Web Server" and select "Restart"
-   - Or use Command Prompt as Administrator:
-     ```batch
-     sc stop SlideshowService
-     sc start SlideshowService
-     ```
-
-### Verifying Access
-
-After changing the service user:
-
-1. **Check service status:**
-   ```batch
-   sc query SlideshowService
-   ```
-
-2. **Check the Windows Event Log** for any access errors:
-   - Open Event Viewer (`eventvwr.msc`)
-   - Navigate to Windows Logs > Application
-   - Look for events from "SlideshowService" or "SlideshowWebServer"
-
-3. **Test the web interface** by accessing the slideshow at `http://localhost:5500`
-
-#### Troubleshooting Access Issues
-
-If you change from Local System to a more restrictive account and encounter access issues:
-
-1. **Verify folder permissions:** Ensure the service account has read access to the media folder
-2. **Check for mapped drives:** NetworkService cannot access mapped drives - use UNC paths instead
-3. **Review Event Log:** Check Windows Event Viewer for specific error messages
-4. **Test with Local System:** Temporarily switch back to Local System to confirm the issue is account-related
-
-**For NetworkService specifically:**
-- Cannot access user profile folders (Documents, Desktop, etc.)
-- Cannot access mapped network drives (use UNC paths like `\\server\share\folder`)
-- May need "Log on as a service" rights for custom accounts
+```batch
+sc stop SlideshowService
+sc start SlideshowService
+```
