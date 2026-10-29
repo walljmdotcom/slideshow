@@ -1,6 +1,7 @@
 {
   "imageDuration": 5,
-  "folderPath": "/Users/walljm/Dropbox/Photos/cfc/youth-media",
+  "folderPath": "./media",
+  "syncIntervalSeconds": 60,
   "fadeTransitionDuration": 1,
   "zoomOnImage": true,
   "displayOrder": "Alpha"

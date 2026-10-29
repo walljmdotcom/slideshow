@@ -1,165 +1,229 @@
-using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using Microsoft.Net.Http.Headers;
 
 namespace SlideshowWebServer;
 
-internal sealed record MediaType(string ContentType, string Type);
+internal readonly record struct MediaType(string ContentType, string Category);
+
+internal readonly record struct MediaStreamResult(
+    FileStream Stream,
+    string ContentType,
+    DateTimeOffset LastModified,
+    EntityTagHeaderValue ETag,
+    bool IsSvg
+);
+
+internal static class MediaTypes
+{
+    public static bool TryGetFromFileName(ReadOnlySpan<char> fileName, out MediaType mediaType)
+    {
+        ReadOnlySpan<char> ext = Path.GetExtension(fileName);
+        if (ext.StartsWith('.'))
+        {
+            ext = ext[1..];
+        }
+
+        if (ext.IsEmpty || ext.Length > 4)
+        {
+            mediaType = default;
+            return false;
+        }
+
+        Span<char> lower = stackalloc char[4];
+        int written = ext.ToLowerInvariant(lower);
+        MediaType? resolved = lower[..written] switch
+        {
+            "png" => new MediaType("image/png", "image"),
+            "jpg" or "jpeg" => new MediaType("image/jpeg", "image"),
+            "gif" => new MediaType("image/gif", "image"),
+            "svg" => new MediaType("image/svg+xml", "image"),
+            "webp" => new MediaType("image/webp", "image"),
+            "bmp" => new MediaType("image/bmp", "image"),
+            "mp4" => new MediaType("video/mp4", "video"),
+            "webm" => new MediaType("video/webm", "video"),
+            "ogg" => new MediaType("video/ogg", "video"),
+            "avi" => new MediaType("video/avi", "video"),
+            "mov" => new MediaType("video/quicktime", "video"),
+            _ => null,
+        };
+
+        if (resolved is { } value)
+        {
+            mediaType = value;
+            return true;
+        }
+
+        mediaType = default;
+        return false;
+    }
+}
 
 public sealed class MediaService
 {
-    private static readonly Dictionary<string, MediaType> SupportedExtensions = new()
-    {
-        // image types
-        { "png",  new MediaType("image/png",       "image") },
-        { "jpg",  new MediaType("image/jpeg",      "image") },
-        { "jpeg", new MediaType("image/jpeg",      "image") },
-        { "gif",  new MediaType("image/gif",       "image") },
-        { "svg",  new MediaType("image/svg+xml",   "image") },
-        { "webp", new MediaType("image/webp",      "image") },
-        { "bmp",  new MediaType("image/bmp",       "image") },
-        // video types
-        { "mp4",  new MediaType("video/mp4",       "video") },
-        { "webm", new MediaType("video/webm",      "video") },
-        { "ogg",  new MediaType("video/ogg",       "video") },
-        { "avi",  new MediaType("video/avi",       "video") },
-        { "mov",  new MediaType("video/quicktime", "video") },
-    };
-
     private readonly ILogger<MediaService> logger;
-    public SlideshowConfig Config { get;  }
+    private readonly string cacheRootWithSeparator;
+    private readonly bool isRandomOrder;
+    private MediaFile[]? cachedFiles;
 
-    public MediaService(ILogger<MediaService> logger)
+    public SlideshowConfig Config { get; }
+    public SlideshowClientConfig ClientConfig { get; }
+    public string SourceFolderPath { get; }
+    public string CacheFolderPath { get; }
+
+    public MediaService(
+        SlideshowConfig config,
+        ILogger<MediaService> logger,
+        string? baseDirectory = null,
+        string? systemdCacheDirectory = null
+    )
     {
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(logger);
+
+        string resolvedBase = string.IsNullOrWhiteSpace(baseDirectory) ? AppContext.BaseDirectory : baseDirectory;
         this.logger = logger;
-        this.Config = LoadConfiguration();
+        this.Config = config;
+        this.ClientConfig = config.ToClientConfig();
+        this.SourceFolderPath = config.ResolveFolderPath(resolvedBase);
+        this.CacheFolderPath = config.ResolveCacheFolderPath(resolvedBase, systemdCacheDirectory);
+        this.cacheRootWithSeparator = Path.EndsInDirectorySeparator(this.CacheFolderPath)
+            ? this.CacheFolderPath
+            : this.CacheFolderPath + Path.DirectorySeparatorChar;
+        this.isRandomOrder = string.Equals(
+            this.ClientConfig.DisplayOrder,
+            SlideshowConfig.RandomDisplayOrder,
+            StringComparison.OrdinalIgnoreCase
+        );
     }
 
-    private SlideshowConfig LoadConfiguration()
+    public MediaFile[] GetMediaFiles()
     {
-        var configPath = Path.Combine(AppContext.BaseDirectory, "config.json");
-        if (File.Exists(configPath))
+        MediaFile[] snapshot = Volatile.Read(ref this.cachedFiles) ?? this.RefreshCacheIndex();
+        if (!this.isRandomOrder || snapshot.Length <= 1)
         {
-            var configData = File.ReadAllText(configPath);
-            var config = JsonSerializer.Deserialize<SlideshowConfig>(configData, JsonSettings.SerializerOptions);
-            if (config != null)
-            {
-                logger.LogInformation("Configuration loaded from: {ConfigPath}", configPath);
-                logger.LogInformation("Configuration contents: {@Config}", config);
-
-                // Ensure the local cache folder exists. We intentionally do NOT validate
-                // FolderPath here — the source share may be temporarily unavailable, and
-                // MediaSyncService will surface that.
-                Directory.CreateDirectory(config.CacheFolderPath);
-
-                return config;
-            }
+            return snapshot;
         }
 
-        // we want to fail catastrophically if the config file couldn't be found,
-        //  since the config file is essential.
-        logger.LogError("Error loading config.json. config.json must be in either: {ConfigPath}", configPath);
-        throw new Exception($"Error loading config.json. config.json must be in either: {configPath}");
+        MediaFile[] shuffled = [.. snapshot];
+        Random.Shared.Shuffle(shuffled);
+        return shuffled;
     }
 
-    public List<MediaFile> GetMediaFiles()
+    public MediaFile[] RefreshCacheIndex()
     {
-        var files = new List<MediaFile>();
-        var folder = this.Config.CacheFolderPath;
-
         try
         {
-            if (!Directory.Exists(folder))
+            DirectoryInfo directory = new(this.CacheFolderPath);
+            if (!directory.Exists)
             {
-                // Cache folder hasn't been populated yet (first run, sync service hasn't completed).
-                // Return empty; the frontend retries on its own.
-                logger.LogWarning("Cache folder does not exist yet: {CacheFolderPath}", folder);
-                return files;
+                Log.CacheFolderMissing(this.logger, this.CacheFolderPath);
+                MediaFile[] empty = [];
+                Volatile.Write(ref this.cachedFiles, empty);
+                return empty;
             }
 
-            var entries = Directory.GetFiles(folder);
-
-            foreach (var filePath in entries)
+            List<MediaFile> discovered = [];
+            foreach (FileInfo entry in directory.EnumerateFiles())
             {
-                var fileName = Path.GetFileName(filePath);
-                var extension = Path.GetExtension(fileName).ToLowerInvariant().TrimStart('.');
-
-                if (SupportedExtensions.TryGetValue(extension, out var supportedExtension))
+                string fileName = entry.Name;
+                if (fileName.EndsWith(".tmp", StringComparison.Ordinal))
                 {
-                    files.Add(
-                        new MediaFile
-                        {
-                            Name = fileName,
-                            Path = filePath,
-                            Type = supportedExtension.Type,
-                        }
-                    );
+                    continue;
+                }
+
+                if ((entry.Attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    continue;
+                }
+
+                if (MediaTypes.TryGetFromFileName(fileName, out MediaType mediaType))
+                {
+                    discovered.Add(new MediaFile(fileName, mediaType.Category));
                 }
             }
 
-            // Sort files based on display order configuration
-            files = this.Config.DisplayOrder.ToLowerInvariant() switch
-            {
-                SlideshowConfig.RandomDisplayOrder => [.. files.OrderBy(static _ => Random.Shared.Next())],
-                _ => [.. files.OrderBy(static f => f.Name)], // alpha is the default
-            };
-
-            logger.LogInformation(
-                "Found {FileCount} media files in cache {CacheFolderPath}, sorted by {DisplayOrder}",
-                files.Count,
-                folder,
-                this.Config.DisplayOrder
-            );
+            discovered.Sort(static (a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Name, b.Name));
+            MediaFile[] sorted = [.. discovered];
+            Volatile.Write(ref this.cachedFiles, sorted);
+            Log.CacheIndexed(this.logger, sorted.Length, this.CacheFolderPath);
+            return sorted;
         }
-        catch (Exception error)
+        catch (Exception ex)
         {
-            logger.LogError(error, "Error reading media from cache folder: {CacheFolderPath}", folder);
+            Log.CacheReadFailed(this.logger, ex, this.CacheFolderPath);
+            return Volatile.Read(ref this.cachedFiles) ?? [];
         }
-
-        return files;
     }
 
-    private static readonly (Stream? stream, string contentType) ErrorMediaFileResult = (null, string.Empty);
-    public Task<(Stream? stream, string contentType)> GetMediaFileStreamAsync(string fileName)
+    internal bool TryOpenMediaFile(string fileName, out MediaStreamResult result)
     {
+        result = default;
+
+        if (string.IsNullOrWhiteSpace(fileName)
+            || fileName is "." or ".."
+            || fileName.IndexOfAny(['/', '\\', '\0']) >= 0
+            || !string.Equals(fileName, Path.GetFileName(fileName), StringComparison.Ordinal))
+        {
+            Log.MediaRequestRejected(this.logger, fileName);
+            return false;
+        }
+
+        if (!MediaTypes.TryGetFromFileName(fileName, out MediaType mediaType))
+        {
+            Log.MediaRequestRejected(this.logger, fileName);
+            return false;
+        }
+
         try
         {
-            var filePath = Path.Combine(this.Config.CacheFolderPath, fileName);
+            string resolvedPath = Path.GetFullPath(Path.Combine(this.cacheRootWithSeparator, fileName));
+            StringComparison comparison = OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
 
-            // Security check: ensure the file is within the cache folder
-            var resolvedPath = Path.GetFullPath(filePath);
-            var resolvedFolder = Path.GetFullPath(this.Config.CacheFolderPath);
-
-            if (!resolvedPath.StartsWith(resolvedFolder, StringComparison.OrdinalIgnoreCase))
+            if (!resolvedPath.StartsWith(this.cacheRootWithSeparator, comparison))
             {
-                logger.LogWarning("Access denied - path outside configured folder: {ResolvedPath}", resolvedPath);
-                return Task.FromResult(ErrorMediaFileResult);
+                Log.MediaRequestRejected(this.logger, fileName);
+                return false;
             }
 
-            if (!File.Exists(filePath))
+            FileInfo fileInfo = new(resolvedPath);
+            if (!fileInfo.Exists)
             {
-                logger.LogWarning("File not found: {FilePath}", filePath);
-                return Task.FromResult(ErrorMediaFileResult);
+                Log.MediaFileNotFound(this.logger, fileName);
+                return false;
             }
 
-            var fileInfo = new FileInfo(filePath);
-            var extension = fileInfo.Extension.ToLowerInvariant().Trim('.');
-
-            if (!SupportedExtensions.TryGetValue(extension, out var supportedExtension))
+            if ((fileInfo.Attributes & FileAttributes.ReparsePoint) != 0)
             {
-                logger.LogWarning("File type not supported: {Extension}", extension);
-                return Task.FromResult(ErrorMediaFileResult);
+                Log.MediaRequestRejected(this.logger, fileName);
+                return false;
             }
 
-            var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            FileStream stream = new(
+                resolvedPath,
+                new FileStreamOptions
+                {
+                    Mode = FileMode.Open,
+                    Access = FileAccess.Read,
+                    Share = FileShare.Read,
+                    Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
+                }
+            );
 
-            logger.LogDebug("Serving media file: {FileName}, Size: {FileSize} bytes", fileName, fileInfo.Length);
+            DateTime utcModified = DateTime.SpecifyKind(fileInfo.LastWriteTimeUtc, DateTimeKind.Utc);
+            DateTimeOffset lastModified = new(utcModified);
+            EntityTagHeaderValue etag = new($"\"{utcModified.Ticks:x}-{fileInfo.Length:x}\"");
+            bool isSvg = string.Equals(mediaType.ContentType, "image/svg+xml", StringComparison.Ordinal);
 
-            return Task.FromResult<(Stream? stream, string contentType)>((stream, supportedExtension.ContentType));
+            Log.ServingMediaFile(this.logger, fileName, fileInfo.Length);
+            result = new MediaStreamResult(stream, mediaType.ContentType, lastModified, etag, isSvg);
+            return true;
         }
-        catch (Exception error)
+        catch (Exception ex)
         {
-            logger.LogError(error, "Error serving media file: {FileName}", fileName);
-            return Task.FromResult(ErrorMediaFileResult);
+            Log.MediaOpenFailed(this.logger, ex, fileName);
+            return false;
         }
     }
 }

@@ -1,30 +1,19 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
     <OutputType>Exe</OutputType>
-  </PropertyGroup>
-
-  <PropertyGroup>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-  </PropertyGroup>
-
-  <PropertyGroup>
     <UseAppHost>true</UseAppHost>
     <PublishTrimmed>true</PublishTrimmed>
     <InvariantGlobalization>true</InvariantGlobalization>
     <PreserveCompilationContext>false</PreserveCompilationContext>
-    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
     <UseRuntimeStore>false</UseRuntimeStore>
     <Optimize>true</Optimize>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
-    <Optimize>False</Optimize>
+    <Optimize>false</Optimize>
   </PropertyGroup>
 
-  <!-- Strip symbols & debug info only when publishing -->
   <PropertyGroup Condition="'$(PublishDir)' != ''">
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
@@ -33,14 +22,12 @@
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <IncludeAllContentForSelfExtract>false</IncludeAllContentForSelfExtract>
 
-    <!-- Disable unused runtime subsystems -->
     <DebuggerSupport>false</DebuggerSupport>
     <MetadataUpdaterSupport>false</MetadataUpdaterSupport>
     <EnableUnsafeBinaryFormatterSerialization>false</EnableUnsafeBinaryFormatterSerialization>
     <EventSourceSupport>false</EventSourceSupport>
     <HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
 
-    <!-- Restrict cultures (already invariant, but keeps satellite pruning explicit) -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
@@ -49,59 +36,72 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="8.0.0" />
-    <PackageReference Include="System.Text.Json" Version="8.0.6" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="9.0.22" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="9.0.22" />
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="web\**\*" />
+    <InternalsVisibleTo Include="SlideshowWebServer.Tests" />
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="config.json">
+    <EmbeddedResource
+      Include="$(MSBuildThisFileDirectory)web\**\*"
+      Exclude="$(MSBuildThisFileDirectory)web\**\.DS_Store">
+      <LogicalName>web/%(RecursiveDir)%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="$(MSBuildThisFileDirectory)config.json">
+      <Link>config.json</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
 
-  <!-- Include win32 directory only for Windows builds -->
   <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' OR '$(RuntimeIdentifier)' == 'win-x86' OR '$(RuntimeIdentifier)' == 'win-arm64'">
-    <Content Include="win32\uninstall-service.bat">
+    <Content Include="$(MSBuildThisFileDirectory)win32\uninstall-service.bat">
+      <Link>win32\uninstall-service.bat</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="win32\install-service.bat">
+    <Content Include="$(MSBuildThisFileDirectory)win32\install-service.bat">
+      <Link>win32\install-service.bat</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
 
-  <!-- Include linux directory only for linux builds -->
   <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-arm64' OR '$(RuntimeIdentifier)' == 'linux-x64'">
-    <Content Include="linux\slideshow.service">
+    <Content Include="$(MSBuildThisFileDirectory)linux\slideshow.service">
+      <Link>linux\slideshow.service</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)linux\kiosk.service">
+      <Link>linux\kiosk.service</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)linux\auto.smb">
+      <Link>linux\auto.smb</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)linux\credential.txt">
+      <Link>linux\credential.txt</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
 
   <ItemGroup>
-    <TrimmerRootDescriptor Include="ILLink.Descriptors.xml" />
+    <TrimmerRootDescriptor Include="$(MSBuildThisFileDirectory)ILLink.Descriptors.xml" />
   </ItemGroup>
 
-
-  <!-- (Optional) Ensure no PDBs remain in publish output -->
-  <Target Name="RemovePdbAfterPublish"
-    AfterTargets="Publish">
+  <Target Name="RemovePdbAfterPublish" AfterTargets="Publish">
     <ItemGroup>
       <_PublishedPdb Include="$(PublishDir)**\*.pdb" />
     </ItemGroup>
     <Delete Files="@(_PublishedPdb)" />
   </Target>
 
-  <!-- Remove aspnetcorev2_inprocess.dll after publish -->
-  <Target Name="RemoveAspNetCoreV2Dll"
-    AfterTargets="Publish">
-    <Message Text="Removing unused files from publish output..."
-      Importance="high" />
-    <Delete Files="$(PublishDir)aspnetcorev2_inprocess.dll"
-      ContinueOnError="true" />
+  <Target Name="RemoveAspNetCoreV2Dll" AfterTargets="Publish">
+    <Delete Files="$(PublishDir)aspnetcorev2_inprocess.dll" ContinueOnError="true" />
   </Target>
 
 </Project>

@@ -3,126 +3,133 @@ using Microsoft.Extensions.Logging;
 
 namespace SlideshowWebServer;
 
-/// <summary>
-/// Mirrors files from <see cref="SlideshowConfig.FolderPath"/> (typically a remote
-/// SMB share) into <see cref="SlideshowConfig.CacheFolderPath"/> on a timer.
-///
-/// Design goals:
-///  - The HTTP layer never touches the source share at request time. All reads
-///    are served from the local cache, so a slow or offline share cannot freeze
-///    the slideshow.
-///  - If the source is unavailable, we leave the cache alone and keep serving
-///    the last known-good set. We retry on the next interval.
-///  - File copies are atomic (write to a temp file, then rename) so a partially
-///    copied file is never visible to readers.
-///  - Per-file failures are isolated. One stuck/locked file does not abort the
-///    whole sync pass.
-/// </summary>
 internal sealed class MediaSyncService : BackgroundService
 {
-    private static readonly HashSet<string> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        // images
-        "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp",
-        // videos
-        "mp4", "webm", "ogg", "avi", "mov",
-    };
-
     private readonly ILogger<MediaSyncService> logger;
     private readonly MediaService mediaService;
 
     public MediaSyncService(ILogger<MediaSyncService> logger, MediaService mediaService)
     {
+        ArgumentNullException.ThrowIfNull(logger);
+        ArgumentNullException.ThrowIfNull(mediaService);
+
         this.logger = logger;
         this.mediaService = mediaService;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var config = this.mediaService.Config;
-        var interval = TimeSpan.FromSeconds(Math.Max(5, config.SyncIntervalSeconds));
+        // Yield so Host.StartAsync binds Kestrel and notifies systemd before touching a stalled SMB mount.
+        await Task.Yield();
 
-        logger.LogInformation(
-            "MediaSyncService starting. Source={Source} Cache={Cache} Interval={Interval}s",
-            config.FolderPath, config.CacheFolderPath, interval.TotalSeconds);
+        TimeSpan interval = TimeSpan.FromSeconds(Math.Max(5, this.mediaService.Config.SyncIntervalSeconds));
+        Log.SyncStarting(
+            this.logger,
+            this.mediaService.SourceFolderPath,
+            this.mediaService.CacheFolderPath,
+            interval.TotalSeconds
+        );
 
-        // Make sure the cache exists before the first pass.
+        _ = this.mediaService.RefreshCacheIndex();
+
         try
         {
-            Directory.CreateDirectory(config.CacheFolderPath);
+            await this.SyncOnceAsync(stoppingToken);
+
+            using PeriodicTimer timer = new(interval);
+            while (await timer.WaitForNextTickAsync(stoppingToken))
+            {
+                await this.SyncOnceAsync(stoppingToken);
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    internal async Task SyncOnceAsync(CancellationToken cancellationToken)
+    {
+        string source = this.mediaService.SourceFolderPath;
+        string cache = this.mediaService.CacheFolderPath;
+
+        try
+        {
+            Directory.CreateDirectory(cache);
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Could not create cache folder {CacheFolderPath}", config.CacheFolderPath);
+            Log.CacheDirectoryFailed(this.logger, ex, cache);
+            return;
         }
 
-        // Run an initial pass right away so a cold start populates the cache.
-        await SyncOnce(config, stoppingToken);
+        Dictionary<string, FileInfo> sourceByOrdinal = new(StringComparer.Ordinal);
+        Dictionary<string, FileInfo> sourceByIgnoreCase = new(StringComparer.OrdinalIgnoreCase);
 
-        using var timer = new PeriodicTimer(interval);
         try
         {
-            while (await timer.WaitForNextTickAsync(stoppingToken))
+            DirectoryInfo sourceDir = new(source);
+            if (!sourceDir.Exists)
             {
-                await SyncOnce(config, stoppingToken);
+                Log.SourceUnavailable(this.logger, source);
+                return;
+            }
+
+            foreach (FileInfo entry in sourceDir.EnumerateFiles())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string fileName = entry.Name;
+                if (fileName.EndsWith(".tmp", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (!MediaTypes.TryGetFromFileName(fileName, out _))
+                {
+                    continue;
+                }
+
+                sourceByOrdinal[fileName] = entry;
+                sourceByIgnoreCase[fileName] = entry;
             }
         }
         catch (OperationCanceledException)
         {
-            // shutting down
-        }
-    }
-
-    private async Task SyncOnce(SlideshowConfig config, CancellationToken cancellationToken)
-    {
-        var source = config.FolderPath;
-        var cache = config.CacheFolderPath;
-
-        // Probe the source. If it's gone, skip this pass (do NOT touch the cache).
-        string[] sourceFiles;
-        try
-        {
-            if (!Directory.Exists(source))
-            {
-                logger.LogWarning("Source folder unavailable, skipping sync: {Source}", source);
-                return;
-            }
-            sourceFiles = Directory.GetFiles(source);
+            throw;
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Source folder probe failed, skipping sync: {Source}", source);
+            Log.SourceProbeFailed(this.logger, ex, source);
             return;
         }
 
-        // Build the set of supported source files and an index of cache file infos.
-        var sourceByName = new Dictionary<string, FileInfo>(StringComparer.OrdinalIgnoreCase);
-        foreach (var path in sourceFiles)
+        Dictionary<string, FileInfo> cacheByOrdinal = new(StringComparer.Ordinal);
+        foreach (FileInfo entry in new DirectoryInfo(cache).EnumerateFiles())
         {
-            var ext = Path.GetExtension(path).TrimStart('.');
-            if (!SupportedExtensions.Contains(ext)) continue;
-            sourceByName[Path.GetFileName(path)] = new FileInfo(path);
+            if (entry.Name.EndsWith(".tmp", StringComparison.Ordinal))
+            {
+                TryDeleteBestEffort(entry.FullName);
+                continue;
+            }
+
+            cacheByOrdinal[entry.Name] = entry;
         }
 
-        var cacheByName = new Dictionary<string, FileInfo>(StringComparer.OrdinalIgnoreCase);
-        foreach (var path in Directory.GetFiles(cache))
+        // An unmounted fstab or autofs mountpoint appears as an empty local directory when the NAS is down.
+        if (sourceByOrdinal.Count == 0 && cacheByOrdinal.Count > 0 && !this.mediaService.Config.AllowEmptySourceSync)
         {
-            // ignore our temp files (atomic-write staging)
-            if (Path.GetFileName(path).EndsWith(".tmp", StringComparison.Ordinal)) continue;
-            cacheByName[Path.GetFileName(path)] = new FileInfo(path);
+            Log.SourceEmptyKeepingCache(this.logger, source, cacheByOrdinal.Count);
+            return;
         }
 
-        // Copy new / changed files.
-        var copied = 0;
-        var skipped = 0;
-        var failed = 0;
-        foreach (var (name, srcInfo) in sourceByName)
+        int copied = 0;
+        int skipped = 0;
+        int failed = 0;
+
+        foreach ((string name, FileInfo srcInfo) in sourceByOrdinal)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (cacheByName.TryGetValue(name, out var cachedInfo)
-                && cachedInfo.Length == srcInfo.Length
-                && cachedInfo.LastWriteTimeUtc == srcInfo.LastWriteTimeUtc)
+            if (cacheByOrdinal.TryGetValue(name, out FileInfo? cachedInfo) && IsUnchanged(cachedInfo, srcInfo))
             {
                 skipped++;
                 continue;
@@ -130,67 +137,136 @@ internal sealed class MediaSyncService : BackgroundService
 
             try
             {
-                await CopyAtomic(srcInfo, Path.Combine(cache, name), cancellationToken);
+                await CopyAtomicAsync(srcInfo, Path.Combine(cache, name), cancellationToken);
                 copied++;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
                 failed++;
-                logger.LogWarning(ex, "Failed to copy {Name} from source to cache", name);
+                Log.FileCopyFailed(this.logger, ex, name);
             }
         }
 
-        // Remove cache files no longer present at source.
-        var removed = 0;
-        foreach (var name in cacheByName.Keys)
+        int removed = 0;
+        HashSet<string>? postCopyCacheNames = null;
+
+        foreach (string cachedName in cacheByOrdinal.Keys)
         {
-            if (sourceByName.ContainsKey(name)) continue;
+            if (sourceByOrdinal.ContainsKey(cachedName))
+            {
+                continue;
+            }
+
+            if (sourceByIgnoreCase.TryGetValue(cachedName, out FileInfo? caseRenamedSource))
+            {
+                // Delete the old casing only when both casings exist as separate files on a case-sensitive filesystem.
+                postCopyCacheNames ??= ReadDirectoryFileNamesOrdinal(cache);
+                if (!postCopyCacheNames.Contains(cachedName) || !postCopyCacheNames.Contains(caseRenamedSource.Name))
+                {
+                    continue;
+                }
+            }
+
             try
             {
-                File.Delete(Path.Combine(cache, name));
+                File.Delete(Path.Combine(cache, cachedName));
                 removed++;
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Failed to remove stale cache file {Name}", name);
+                Log.StaleFileDeleteFailed(this.logger, ex, cachedName);
             }
         }
 
-        // Clean up any orphaned temp files from a prior failed copy.
-        foreach (var path in Directory.GetFiles(cache, "*.tmp"))
+        if (copied > 0 || removed > 0)
         {
-            try { File.Delete(path); } catch { /* best effort */ }
+            _ = this.mediaService.RefreshCacheIndex();
         }
 
-        logger.LogInformation(
-            "Sync complete: copied={Copied} skipped={Skipped} removed={Removed} failed={Failed} sourceCount={SourceCount}",
-            copied, skipped, removed, failed, sourceByName.Count);
+        Log.SyncCompleted(this.logger, copied, skipped, removed, failed, sourceByOrdinal.Count);
     }
 
-    private static async Task CopyAtomic(FileInfo source, string destinationPath, CancellationToken cancellationToken)
-    {
-        var tempPath = destinationPath + ".tmp";
+    private static bool IsUnchanged(FileInfo cached, FileInfo source) =>
+        cached.Length == source.Length
+        && Math.Abs((cached.LastWriteTimeUtc - source.LastWriteTimeUtc).Ticks) < TimeSpan.TicksPerMillisecond;
 
-        // Open the source with FileShare.Read so we still race-lose cleanly if
-        // the producer (e.g. NAS uploader) has it open for write \u2014 we just throw
-        // and the outer loop logs and moves on.
-        await using (var src = new FileStream(source.FullName, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 81920, useAsync: true))
-        await using (var dst = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 81920, useAsync: true))
+    private static HashSet<string> ReadDirectoryFileNamesOrdinal(string directoryPath)
+    {
+        HashSet<string> names = new(StringComparer.Ordinal);
+        foreach (string filePath in Directory.EnumerateFiles(directoryPath))
         {
-            await src.CopyToAsync(dst, cancellationToken);
+            string name = Path.GetFileName(filePath);
+            if (!name.EndsWith(".tmp", StringComparison.Ordinal))
+            {
+                _ = names.Add(name);
+            }
         }
 
-        // Preserve mtime so our "changed?" check works.
+        return names;
+    }
+
+    private static async Task CopyAtomicAsync(
+        FileInfo source,
+        string destinationPath,
+        CancellationToken cancellationToken
+    )
+    {
+        string tempPath = destinationPath + ".tmp";
+
         try
         {
-            File.SetLastWriteTimeUtc(tempPath, source.LastWriteTimeUtc);
+            FileStreamOptions readOptions = new()
+            {
+                Mode = FileMode.Open,
+                Access = FileAccess.Read,
+                Share = FileShare.Read,
+                BufferSize = 81920,
+                Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
+            };
+            FileStreamOptions writeOptions = new()
+            {
+                Mode = FileMode.Create,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+                BufferSize = 81920,
+                Options = FileOptions.Asynchronous,
+            };
+
+            await using (FileStream src = new(source.FullName, readOptions))
+            await using (FileStream dst = new(tempPath, writeOptions))
+            {
+                await src.CopyToAsync(dst, cancellationToken);
+            }
+
+            try
+            {
+                File.SetLastWriteTimeUtc(tempPath, source.LastWriteTimeUtc);
+            }
+            catch
+            {
+            }
+
+            File.Move(tempPath, destinationPath, overwrite: true);
         }
         catch
         {
-            // non-fatal; will just trigger a re-copy next pass
+            TryDeleteBestEffort(tempPath);
+            throw;
         }
+    }
 
-        // Atomic replace on POSIX; on Windows File.Move with overwrite is also atomic enough for our purposes.
-        File.Move(tempPath, destinationPath, overwrite: true);
+    private static void TryDeleteBestEffort(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch
+        {
+        }
     }
 }

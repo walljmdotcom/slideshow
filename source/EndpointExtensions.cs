@@ -1,60 +1,88 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 
 namespace SlideshowWebServer;
 
 public static class EndpointExtensions
 {
-    public static void AddSlideshowEndpoints(this IEndpointRouteBuilder app)
+    private const string SvgContentSecurityPolicy = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+    private static readonly string[] GetAndHeadMethods = ["GET", "HEAD"];
+
+    public static void AddSlideshowEndpoints(this WebApplication app)
     {
-        // API endpoints
-        var api = app.MapGroup("/api");
-        api.MapGet("config", static (MediaService mediaService) => Results.Json(mediaService.Config));
-        api.MapGet("files", static (MediaService mediaService) => Results.Json(mediaService.GetMediaFiles()));
+        ArgumentNullException.ThrowIfNull(app);
 
-        // Media file serving
-        app.MapGet("/media/{fileName}", GetMediaFiles);
+        app.Use(static (HttpContext context, RequestDelegate next) =>
+        {
+            context.Response.Headers.XContentTypeOptions = "nosniff";
+            return next(context);
+        });
 
-        // Static file serving from embedded resources
-        app.MapGet("/{*path}", EmbeddedFileHandler);
+        RouteGroupBuilder api = app.MapGroup("/api");
+        api.MapGet(
+            "config",
+            static (MediaService mediaService) =>
+                TypedResults.Json(mediaService.ClientConfig, JsonContext.Default.SlideshowClientConfig)
+        );
+        api.MapGet(
+            "files",
+            static (MediaService mediaService) =>
+                TypedResults.Json(mediaService.GetMediaFiles(), JsonContext.Default.MediaFileArray)
+        );
+
+        app.MapMethods("/media/{fileName}", GetAndHeadMethods, GetMediaFile);
+        app.MapMethods("/{*path}", GetAndHeadMethods, GetEmbeddedFile);
     }
 
-    private static async Task<Results<FileStreamHttpResult, NotFound<string>>> GetMediaFiles(
-        [FromServices] MediaService mediaService,
-        [FromRoute] string fileName
+    private static Results<FileStreamHttpResult, NotFound<string>> GetMediaFile(
+        HttpContext httpContext,
+        MediaService mediaService,
+        string fileName
     )
     {
-        var (stream, contentType) = await mediaService.GetMediaFileStreamAsync(fileName);
-        return stream is null
-            ? TypedResults.NotFound("File not found")
-            : TypedResults.Stream(stream, contentType, fileName, DateTimeOffset.UtcNow, enableRangeProcessing: true);
+        if (!mediaService.TryOpenMediaFile(fileName, out MediaStreamResult media))
+        {
+            return TypedResults.NotFound("File not found");
+        }
+
+        httpContext.Response.Headers.CacheControl = "no-cache";
+        if (media.IsSvg)
+        {
+            httpContext.Response.Headers.ContentSecurityPolicy = SvgContentSecurityPolicy;
+        }
+
+        return TypedResults.Stream(
+            media.Stream,
+            contentType: media.ContentType,
+            fileDownloadName: null,
+            lastModified: media.LastModified,
+            entityTag: media.ETag,
+            enableRangeProcessing: true
+        );
     }
 
-    /// <summary>
-    /// Only handles files from the embedded file provider
-    /// </summary>
-    private static async Task<Results<FileContentHttpResult, NotFound<string>>> EmbeddedFileHandler(
-        [FromServices] EmbeddedFileProvider fileProvider,
-        [FromRoute] string? path
+    private static Results<FileContentHttpResult, NotFound<string>> GetEmbeddedFile(
+        HttpContext httpContext,
+        EmbeddedFileProvider fileProvider,
+        string? path
     )
     {
-        // Default to index.html
-        if (string.IsNullOrEmpty(path) || path == "/")
+        string targetPath = string.IsNullOrEmpty(path) || path == "/" ? "index.html" : path;
+        if (!fileProvider.TryGetAsset(targetPath, out EmbeddedAsset? asset))
         {
-            path = "index.html";
+            return TypedResults.NotFound("File not found");
         }
 
-        try
-        {
-            var (content, contentType) = await fileProvider.GetFileAsync(path);
-            return TypedResults.Bytes(content, contentType);
-        }
-        catch (FileNotFoundException)
-        {
-            return TypedResults.NotFound($"File '{path}' not found");
-        }
+        httpContext.Response.Headers.CacheControl = "no-cache";
+        return TypedResults.Bytes(
+            asset.Content,
+            contentType: asset.ContentType,
+            fileDownloadName: null,
+            enableRangeProcessing: false,
+            lastModified: null,
+            entityTag: asset.ETag
+        );
     }
 }
