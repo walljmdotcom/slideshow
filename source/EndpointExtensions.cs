@@ -8,6 +8,7 @@ namespace SlideshowWebServer;
 public static class EndpointExtensions
 {
     private const string SvgContentSecurityPolicy = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+    private const string ImmutableCacheControl = "private, max-age=31536000, immutable";
     private static readonly string[] GetAndHeadMethods = ["GET", "HEAD"];
 
     public static void AddSlideshowEndpoints(this WebApplication app)
@@ -36,25 +37,29 @@ public static class EndpointExtensions
         app.MapMethods("/{*path}", GetAndHeadMethods, GetEmbeddedFile);
     }
 
-    private static Results<FileStreamHttpResult, NotFound<string>> GetMediaFile(
+    private static Results<PhysicalFileHttpResult, NotFound<string>> GetMediaFile(
         HttpContext httpContext,
         MediaService mediaService,
-        string fileName
+        string fileName,
+        string? v = null
     )
     {
-        if (!mediaService.TryOpenMediaFile(fileName, out MediaStreamResult media))
+        if (!mediaService.TryResolveMediaFile(fileName, out ResolvedMediaFile media))
         {
             return TypedResults.NotFound("File not found");
         }
 
-        httpContext.Response.Headers.CacheControl = "no-cache";
+        bool isVersionMatched = !string.IsNullOrEmpty(v)
+            && string.Equals(v, media.Version, StringComparison.Ordinal);
+        httpContext.Response.Headers.CacheControl = isVersionMatched ? ImmutableCacheControl : "no-cache";
+
         if (media.IsSvg)
         {
             httpContext.Response.Headers.ContentSecurityPolicy = SvgContentSecurityPolicy;
         }
 
-        return TypedResults.Stream(
-            media.Stream,
+        return TypedResults.PhysicalFile(
+            media.PhysicalPath,
             contentType: media.ContentType,
             fileDownloadName: null,
             lastModified: media.LastModified,

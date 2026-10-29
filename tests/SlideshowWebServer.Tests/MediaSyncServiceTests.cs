@@ -6,7 +6,7 @@ namespace SlideshowWebServer.Tests;
 public sealed class MediaSyncServiceTests
 {
     [Fact]
-    public async Task SyncOnceAsync_MirrorsSupportedFilesPreservesMtimeAndCleansOrphanTmp()
+    public async Task SyncOnceAsync_MirrorsSupportedFilesPreservesMtimeAndCleansOrphanArtifacts()
     {
         using TempWorkspace workspace = new();
         DateTime fixedMtime = new(2025, 6, 15, 14, 30, 0, DateTimeKind.Utc);
@@ -16,20 +16,17 @@ public sealed class MediaSyncServiceTests
         workspace.WriteFile(workspace.SourcePath, "ignore.txt", "skip"u8, fixedMtime);
         workspace.WriteFile(workspace.SourcePath, "partial.jpg.tmp", [9], fixedMtime);
         workspace.WriteFile(workspace.CachePath, "orphan.png.tmp", [99]);
+        workspace.WriteFile(workspace.CachePath, "displaced.png.old", [88]);
 
         (MediaService mediaService, MediaSyncService syncService) = CreateServices(workspace);
 
         await syncService.SyncOnceAsync(CancellationToken.None);
 
         MediaFile[] cached = mediaService.GetMediaFiles();
-        Assert.Equal(
-            [
-                new MediaFile("a.png", "image"),
-                new MediaFile("b.mp4", "video"),
-            ],
-            cached
-        );
+        Assert.Equal(["a.png", "b.mp4"], cached.Select(static f => f.Name).ToArray());
+        Assert.Equal(["image", "video"], cached.Select(static f => f.Type).ToArray());
         Assert.False(File.Exists(Path.Combine(workspace.CachePath, "orphan.png.tmp")));
+        Assert.False(File.Exists(Path.Combine(workspace.CachePath, "displaced.png.old")));
         Assert.False(File.Exists(Path.Combine(workspace.CachePath, "ignore.txt")));
         Assert.Equal(fixedMtime, File.GetLastWriteTimeUtc(Path.Combine(workspace.CachePath, "a.png")));
 
@@ -137,6 +134,94 @@ public sealed class MediaSyncServiceTests
         Assert.Single(mediaService.GetMediaFiles());
     }
 
+    [Fact]
+    public async Task SyncOnceAsync_SurvivesDanglingSymlinkInSourceWithoutDeletingCachedCopy()
+    {
+        using TempWorkspace workspace = new();
+        Directory.CreateDirectory(workspace.SourcePath);
+        workspace.WriteFile(workspace.SourcePath, "good.png", [10, 20]);
+        workspace.WriteFile(workspace.CachePath, "dangling.png", [99, 98, 97]);
+
+        string danglingLink = Path.Combine(workspace.SourcePath, "dangling.png");
+        try
+        {
+            File.CreateSymbolicLink(danglingLink, Path.Combine(workspace.RootPath, "does-not-exist.png"));
+        }
+        catch (IOException)
+        {
+            // Symbolic links require elevated privileges on unconfigured Windows hosts.
+            return;
+        }
+
+        (MediaService mediaService, MediaSyncService syncService) = CreateServices(workspace);
+        _ = mediaService.RefreshCacheIndex();
+
+        await syncService.SyncOnceAsync(CancellationToken.None);
+
+        Assert.True(File.Exists(Path.Combine(workspace.CachePath, "good.png")));
+        Assert.True(File.Exists(Path.Combine(workspace.CachePath, "dangling.png")));
+        Assert.Equal(
+            ["dangling.png", "good.png"],
+            mediaService.GetMediaFiles().Select(static f => f.Name).ToArray()
+        );
+    }
+
+    [Fact]
+    public async Task SyncOnceAsync_UpdatesAndDeletesCachedFileWhileOpenWithFileShareDelete()
+    {
+        using TempWorkspace workspace = new();
+        string sourceClip = workspace.WriteFile(workspace.SourcePath, "clip.mp4", [1, 2, 3, 4]);
+        workspace.WriteFile(workspace.SourcePath, "keep.png", [9]);
+
+        (MediaService mediaService, MediaSyncService syncService) = CreateServices(workspace);
+        await syncService.SyncOnceAsync(CancellationToken.None);
+
+        string cachedClip = Path.Combine(workspace.CachePath, "clip.mp4");
+        await using FileStream activeReader = new(
+            cachedClip,
+            new FileStreamOptions
+            {
+                Mode = FileMode.Open,
+                Access = FileAccess.Read,
+                Share = FileShare.ReadWrite | FileShare.Delete,
+            }
+        );
+
+        File.WriteAllBytes(sourceClip, [5, 6, 7, 8, 9, 10]);
+        await syncService.SyncOnceAsync(CancellationToken.None);
+        Assert.Equal([5, 6, 7, 8, 9, 10], await File.ReadAllBytesAsync(cachedClip));
+
+        File.Delete(sourceClip);
+        await syncService.SyncOnceAsync(CancellationToken.None);
+        Assert.Equal(["keep.png"], mediaService.GetMediaFiles().Select(static f => f.Name).ToArray());
+    }
+
+    [Fact]
+    public async Task CopyStreamWithTimeoutAsync_FailsStalledStreamAndAllowsSlowProgressingStream()
+    {
+        using MemoryStream destination = new();
+        await using StallingStream stalled = new();
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            MediaSyncService.CopyStreamWithTimeoutAsync(
+                stalled,
+                destination,
+                TimeSpan.FromMilliseconds(100),
+                CancellationToken.None
+            )
+        );
+
+        await using DripStream progressing = new(chunkCount: 4, delayBetweenChunksMs: 35);
+        using MemoryStream completed = new();
+        await MediaSyncService.CopyStreamWithTimeoutAsync(
+            progressing,
+            completed,
+            TimeSpan.FromMilliseconds(150),
+            CancellationToken.None
+        );
+        Assert.Equal([1, 2, 3, 4], completed.ToArray());
+    }
+
     private static (MediaService Media, MediaSyncService Sync) CreateServices(
         TempWorkspace workspace,
         bool allowEmptySourceSync = false
@@ -151,5 +236,86 @@ public sealed class MediaSyncServiceTests
         MediaService mediaService = new(config, NullLogger<MediaService>.Instance, workspace.RootPath);
         MediaSyncService syncService = new(NullLogger<MediaSyncService>.Instance, mediaService);
         return (mediaService, syncService);
+    }
+
+    private sealed class StallingStream : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default
+        )
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return 0;
+        }
+    }
+
+    private sealed class DripStream : Stream
+    {
+        private readonly int chunkCount;
+        private readonly int delayMs;
+        private int emitted;
+
+        public DripStream(int chunkCount, int delayBetweenChunksMs)
+        {
+            this.chunkCount = chunkCount;
+            this.delayMs = delayBetweenChunksMs;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default
+        )
+        {
+            if (this.emitted >= this.chunkCount)
+            {
+                return 0;
+            }
+
+            await Task.Delay(this.delayMs, cancellationToken);
+            this.emitted++;
+            buffer.Span[0] = (byte)this.emitted;
+            return 1;
+        }
     }
 }

@@ -111,7 +111,7 @@ public sealed record SlideshowClientConfig(
     string DisplayOrder
 );
 
-public sealed record MediaFile(string Name, string Type);
+public sealed record MediaFile(string Name, string Type, string Version);
 
 internal static class SlideshowConfiguration
 {

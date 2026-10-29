@@ -34,6 +34,10 @@ builder.Services.Configure<JsonOptions>(static options =>
 {
     options.SerializerOptions.TypeInfoResolverChain.Insert(0, JsonContext.Default);
 });
+builder.Services.Configure<HostOptions>(static options =>
+{
+    options.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore;
+});
 
 builder.Services.AddSingleton(slideshowConfig);
 builder.Services.AddSingleton<MediaService>(sp =>

@@ -22,6 +22,7 @@ public sealed class MediaServiceTests
     [InlineData("page.html", false, "", "")]
     [InlineData("archive.tar.gz", false, "", "")]
     [InlineData("photo.png.tmp", false, "", "")]
+    [InlineData("photo.png.old", false, "", "")]
     [InlineData("noext", false, "", "")]
     [InlineData(".png", true, "image/png", "image")]
     [InlineData("", false, "", "")]
@@ -52,13 +53,17 @@ public sealed class MediaServiceTests
     [InlineData("sub\\photo.png")]
     [InlineData("/etc/passwd")]
     [InlineData("secret.txt")]
+    [InlineData("staging.png.tmp")]
+    [InlineData("displaced.png.old")]
     [InlineData("missing.png")]
-    public void TryOpenMediaFile_RejectsInvalidTraversalAndUnsupportedInputs(string requestedName)
+    public void TryResolveMediaFile_RejectsInvalidTraversalAndUnsupportedInputs(string requestedName)
     {
         using TempWorkspace workspace = new();
         string siblingDir = workspace.CreateDirectory("cache-sibling");
         workspace.WriteFile(siblingDir, "secret.png", [1, 2, 3]);
         workspace.WriteFile(workspace.CachePath, "secret.txt", "nope"u8);
+        workspace.WriteFile(workspace.CachePath, "staging.png.tmp", [1, 2]);
+        workspace.WriteFile(workspace.CachePath, "displaced.png.old", [1, 2]);
         workspace.WriteFile(workspace.CachePath, "valid.png", [137, 80, 78, 71]);
 
         SlideshowConfig config = new()
@@ -68,13 +73,13 @@ public sealed class MediaServiceTests
         };
         MediaService service = new(config, NullLogger<MediaService>.Instance, workspace.RootPath);
 
-        bool opened = service.TryOpenMediaFile(requestedName, out MediaStreamResult media);
-        Assert.False(opened);
-        Assert.Null(media.Stream);
+        bool resolved = service.TryResolveMediaFile(requestedName, out ResolvedMediaFile media);
+        Assert.False(resolved);
+        Assert.Null(media.PhysicalPath);
     }
 
     [Fact]
-    public void TryOpenMediaFile_RejectsNullByteInFileName()
+    public void TryResolveMediaFile_RejectsNullByteInFileName()
     {
         using TempWorkspace workspace = new();
         workspace.WriteFile(workspace.CachePath, "valid.png", [1, 2, 3]);
@@ -86,12 +91,12 @@ public sealed class MediaServiceTests
         };
         MediaService service = new(config, NullLogger<MediaService>.Instance, workspace.RootPath);
 
-        bool opened = service.TryOpenMediaFile("valid.png\0.txt", out _);
-        Assert.False(opened);
+        bool resolved = service.TryResolveMediaFile("valid.png\0.txt", out _);
+        Assert.False(resolved);
     }
 
     [Fact]
-    public void TryOpenMediaFile_RejectsSymlinkEscapingCacheDirectory()
+    public void TryResolveMediaFile_RejectsSymlinkEscapingCacheDirectory()
     {
         using TempWorkspace workspace = new();
         Directory.CreateDirectory(workspace.CachePath);
@@ -116,18 +121,20 @@ public sealed class MediaServiceTests
         MediaService service = new(config, NullLogger<MediaService>.Instance, workspace.RootPath);
 
         Assert.Empty(service.RefreshCacheIndex());
-        Assert.False(service.TryOpenMediaFile("linked.png", out _));
+        Assert.False(service.TryResolveMediaFile("linked.png", out _));
     }
 
     [Fact]
-    public void GetMediaFiles_SortsAlphabeticallyAndSkipsTempAndUnsupportedFiles()
+    public void GetMediaFiles_SortsAlphabeticallySkipsTempArtifactsAndUpdatesVersionOnEdit()
     {
         using TempWorkspace workspace = new();
-        workspace.WriteFile(workspace.CachePath, "zeta.mp4", [1]);
-        workspace.WriteFile(workspace.CachePath, "Alpha.png", [2]);
-        workspace.WriteFile(workspace.CachePath, "beta.jpg", [3]);
-        workspace.WriteFile(workspace.CachePath, "staging.png.tmp", [4]);
-        workspace.WriteFile(workspace.CachePath, "readme.md", [5]);
+        DateTime initialTime = new(2025, 4, 1, 8, 0, 0, DateTimeKind.Utc);
+        workspace.WriteFile(workspace.CachePath, "zeta.mp4", [1], initialTime);
+        workspace.WriteFile(workspace.CachePath, "Alpha.png", [2, 3], initialTime);
+        workspace.WriteFile(workspace.CachePath, "beta.jpg", [4, 5, 6], initialTime);
+        workspace.WriteFile(workspace.CachePath, "staging.png.tmp", [7], initialTime);
+        workspace.WriteFile(workspace.CachePath, "displaced.png.old", [8], initialTime);
+        workspace.WriteFile(workspace.CachePath, "readme.md", [9], initialTime);
 
         SlideshowConfig config = new()
         {
@@ -138,13 +145,13 @@ public sealed class MediaServiceTests
         MediaService service = new(config, NullLogger<MediaService>.Instance, workspace.RootPath);
 
         MediaFile[] files = service.GetMediaFiles();
-        Assert.Equal(
-            [
-                new MediaFile("Alpha.png", "image"),
-                new MediaFile("beta.jpg", "image"),
-                new MediaFile("zeta.mp4", "video"),
-            ],
-            files
-        );
+        Assert.Equal(["Alpha.png", "beta.jpg", "zeta.mp4"], files.Select(static f => f.Name).ToArray());
+        Assert.Equal(["image", "image", "video"], files.Select(static f => f.Type).ToArray());
+        string initialAlphaVersion = files[0].Version;
+        Assert.False(string.IsNullOrWhiteSpace(initialAlphaVersion));
+
+        workspace.WriteFile(workspace.CachePath, "Alpha.png", [2, 3, 4, 5], initialTime.AddSeconds(10));
+        MediaFile[] refreshed = service.RefreshCacheIndex();
+        Assert.NotEqual(initialAlphaVersion, refreshed[0].Version);
     }
 }

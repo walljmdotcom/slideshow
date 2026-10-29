@@ -13,7 +13,7 @@ namespace SlideshowWebServer.Tests;
 public sealed class HttpEndpointsTests
 {
     [Fact]
-    public async Task ApiEndpoints_OmitInternalServerPathsAndReturnExpectedShape()
+    public async Task ApiEndpoints_OmitInternalServerPathsAndReturnVersionedFiles()
     {
         using TempWorkspace workspace = new();
         workspace.WriteFile(workspace.CachePath, "hero.png", [137, 80, 78, 71]);
@@ -46,6 +46,20 @@ public sealed class HttpEndpointsTests
         JsonElement first = filesDoc.RootElement[0];
         Assert.Equal("hero.png", first.GetProperty("name").GetString());
         Assert.Equal("image", first.GetProperty("type").GetString());
+        string? version = first.GetProperty("version").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(version));
+
+        using HttpResponseMessage immutableResponse = await client.GetAsync($"/media/hero.png?v={version}");
+        Assert.Equal(HttpStatusCode.OK, immutableResponse.StatusCode);
+        CacheControlHeaderValue? immutableCache = immutableResponse.Headers.CacheControl;
+        Assert.NotNull(immutableCache);
+        Assert.True(immutableCache.Private);
+        Assert.Equal(TimeSpan.FromSeconds(31536000), immutableCache.MaxAge);
+        Assert.Contains(immutableCache.Extensions, static ext => ext.Name == "immutable");
+
+        using HttpResponseMessage staleQueryResponse = await client.GetAsync("/media/hero.png?v=stale");
+        Assert.Equal(HttpStatusCode.OK, staleQueryResponse.StatusCode);
+        Assert.True(staleQueryResponse.Headers.CacheControl?.NoCache);
     }
 
     [Fact]
@@ -68,6 +82,7 @@ public sealed class HttpEndpointsTests
         using HttpResponseMessage fullResponse = await client.GetAsync("/media/clip.mp4");
         Assert.Equal(HttpStatusCode.OK, fullResponse.StatusCode);
         Assert.Null(fullResponse.Content.Headers.ContentDisposition);
+        Assert.Equal("no-cache", fullResponse.Headers.CacheControl?.ToString());
         Assert.Equal(new DateTimeOffset(mtime), fullResponse.Content.Headers.LastModified);
         EntityTagHeaderValue? etag = fullResponse.Headers.ETag;
         Assert.NotNull(etag);

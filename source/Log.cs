@@ -129,4 +129,18 @@ internal static partial class Log
         int failed,
         int sourceCount
     );
+
+    [LoggerMessage(
+        EventId = 17,
+        Level = LogLevel.Error,
+        Message = "Unhandled error during media sync cycle"
+    )]
+    public static partial void SyncIterationFailed(ILogger logger, Exception exception);
+
+    [LoggerMessage(
+        EventId = 18,
+        Level = LogLevel.Warning,
+        Message = "Failed to stat source file {Name}; keeping any cached copy"
+    )]
+    public static partial void SourceEntryStatFailed(ILogger logger, Exception exception, string name);
 }

@@ -5,11 +5,12 @@ namespace SlideshowWebServer;
 
 internal readonly record struct MediaType(string ContentType, string Category);
 
-internal readonly record struct MediaStreamResult(
-    FileStream Stream,
+internal readonly record struct ResolvedMediaFile(
+    string PhysicalPath,
     string ContentType,
     DateTimeOffset LastModified,
     EntityTagHeaderValue ETag,
+    string Version,
     bool IsSvg
 );
 
@@ -56,6 +57,16 @@ internal static class MediaTypes
         mediaType = default;
         return false;
     }
+
+    public static bool IsTemporaryCacheArtifact(ReadOnlySpan<char> fileName) =>
+        fileName.EndsWith(".tmp", StringComparison.Ordinal)
+        || fileName.EndsWith(".old", StringComparison.Ordinal);
+
+    public static string FormatVersion(DateTime lastWriteTimeUtc, long byteLength)
+    {
+        DateTime utc = DateTime.SpecifyKind(lastWriteTimeUtc, DateTimeKind.Utc);
+        return $"{utc.Ticks:x}-{byteLength:x}";
+    }
 }
 
 public sealed class MediaService
@@ -69,6 +80,7 @@ public sealed class MediaService
     public SlideshowClientConfig ClientConfig { get; }
     public string SourceFolderPath { get; }
     public string CacheFolderPath { get; }
+    public bool HasCachedFiles => Volatile.Read(ref this.cachedFiles) is { Length: > 0 };
 
     public MediaService(
         SlideshowConfig config,
@@ -126,19 +138,31 @@ public sealed class MediaService
             foreach (FileInfo entry in directory.EnumerateFiles())
             {
                 string fileName = entry.Name;
-                if (fileName.EndsWith(".tmp", StringComparison.Ordinal))
+                if (MediaTypes.IsTemporaryCacheArtifact(fileName))
                 {
                     continue;
                 }
 
-                if ((entry.Attributes & FileAttributes.ReparsePoint) != 0)
+                if (!MediaTypes.TryGetFromFileName(fileName, out MediaType mediaType))
                 {
                     continue;
                 }
 
-                if (MediaTypes.TryGetFromFileName(fileName, out MediaType mediaType))
+                try
                 {
-                    discovered.Add(new MediaFile(fileName, mediaType.Category));
+                    if ((entry.Attributes & FileAttributes.ReparsePoint) != 0)
+                    {
+                        continue;
+                    }
+
+                    string version = MediaTypes.FormatVersion(entry.LastWriteTimeUtc, entry.Length);
+                    discovered.Add(new MediaFile(fileName, mediaType.Category, version));
+                }
+                catch (IOException)
+                {
+                }
+                catch (UnauthorizedAccessException)
+                {
                 }
             }
 
@@ -155,7 +179,7 @@ public sealed class MediaService
         }
     }
 
-    internal bool TryOpenMediaFile(string fileName, out MediaStreamResult result)
+    internal bool TryResolveMediaFile(string fileName, out ResolvedMediaFile result)
     {
         result = default;
 
@@ -168,7 +192,8 @@ public sealed class MediaService
             return false;
         }
 
-        if (!MediaTypes.TryGetFromFileName(fileName, out MediaType mediaType))
+        if (MediaTypes.IsTemporaryCacheArtifact(fileName)
+            || !MediaTypes.TryGetFromFileName(fileName, out MediaType mediaType))
         {
             Log.MediaRequestRejected(this.logger, fileName);
             return false;
@@ -200,24 +225,21 @@ public sealed class MediaService
                 return false;
             }
 
-            FileStream stream = new(
-                resolvedPath,
-                new FileStreamOptions
-                {
-                    Mode = FileMode.Open,
-                    Access = FileAccess.Read,
-                    Share = FileShare.Read,
-                    Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
-                }
-            );
-
             DateTime utcModified = DateTime.SpecifyKind(fileInfo.LastWriteTimeUtc, DateTimeKind.Utc);
             DateTimeOffset lastModified = new(utcModified);
-            EntityTagHeaderValue etag = new($"\"{utcModified.Ticks:x}-{fileInfo.Length:x}\"");
+            string version = MediaTypes.FormatVersion(utcModified, fileInfo.Length);
+            EntityTagHeaderValue etag = new($"\"{version}\"");
             bool isSvg = string.Equals(mediaType.ContentType, "image/svg+xml", StringComparison.Ordinal);
 
             Log.ServingMediaFile(this.logger, fileName, fileInfo.Length);
-            result = new MediaStreamResult(stream, mediaType.ContentType, lastModified, etag, isSvg);
+            result = new ResolvedMediaFile(
+                resolvedPath,
+                mediaType.ContentType,
+                lastModified,
+                etag,
+                version,
+                isSvg
+            );
             return true;
         }
         catch (Exception ex)
