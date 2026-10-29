@@ -27,7 +27,7 @@ body {
     justify-content: center;
     align-items: center;
     opacity: 0;
-    transition: opacity 1s ease-in-out;
+    transition: opacity var(--fade-duration, 1s) ease-in-out;
     z-index: 1;
 }
 
@@ -78,20 +78,6 @@ body {
     font-size: 18px;
     z-index: 10;
     text-align: center;
-}
-
-.error {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    font-size: 18px;
-    color: #ff6b6b;
-    z-index: 10;
-    text-align: center;
-    background: rgba(0, 0, 0, 0.8);
-    padding: 20px;
-    border-radius: 8px;
 }
 
 .waiting {

@@ -1,28 +1,15 @@
-// Default config used until /api/config responds. Keeps the slideshow alive
-// even if the server is unreachable on first load.
 const DEFAULT_CONFIG = {
     imageDuration: 5,
     fadeTransitionDuration: 1,
     zoomOnImage: true,
-    displayOrder: 'Alpha',
+    displayOrder: 'alpha',
 };
 
-// How often to refresh the file list while running (ms). The server-side
-// MediaSyncService mirrors SMB on a timer; this picks up new media without
-// requiring a page reload.
 const FILE_LIST_REFRESH_MS = 5 * 60 * 1000;
-
-// Fetch timeout - server may be frozen; never wait forever.
 const FETCH_TIMEOUT_MS = 10 * 1000;
-
-// Backoff schedule for failed fetches (ms). Caps at the last value.
 const RETRY_BACKOFF_MS = [2000, 5000, 10000, 30000, 60000];
-
-// Watchdog: if no slide advances in this multiple of imageDuration, recover.
 const WATCHDOG_MULTIPLIER = 4;
 const WATCHDOG_MIN_MS = 20 * 1000;
-
-// Consecutive media load failures after which we force a page reload.
 const MAX_CONSECUTIVE_MEDIA_ERRORS = 25;
 
 async function fetchJsonWithTimeout(url, timeoutMs) {
@@ -40,8 +27,8 @@ async function fetchJsonWithTimeout(url, timeoutMs) {
 }
 
 function backoffFor(attempt) {
-    const i = Math.min(attempt, RETRY_BACKOFF_MS.length - 1);
-    return RETRY_BACKOFF_MS[i];
+    const index = Math.min(attempt, RETRY_BACKOFF_MS.length - 1);
+    return RETRY_BACKOFF_MS[index];
 }
 
 class Slideshow {
@@ -49,18 +36,21 @@ class Slideshow {
         this.files = [];
         this.currentIndex = 0;
         this.timer = null;
-        this.currentContainer = 0;
-        this.config = DEFAULT_CONFIG;
+        this.cleanupTimer = null;
+        this.currentContainer = -1;
+        this.slideToken = 0;
+        this.advancing = false;
+        this.config = { ...DEFAULT_CONFIG };
         this.lastAdvanceAt = Date.now();
         this.consecutiveMediaErrors = 0;
         this.fileRefreshTimer = null;
         this.watchdogTimer = null;
 
+        this.applyConfigStyles();
         this.init().then(() => {});
     }
 
     async init() {
-        // Always proceed - config and files retry forever in the background.
         await this.loadConfigWithRetry();
         await this.loadFilesUntilNonEmpty();
         this.hideLoading();
@@ -70,19 +60,24 @@ class Slideshow {
         this.startWatchdog();
     }
 
+    applyConfigStyles() {
+        const fadeSeconds = Math.max(0, Number(this.config.fadeTransitionDuration ?? 1) || 0);
+        document.documentElement.style.setProperty('--fade-duration', `${fadeSeconds}s`);
+    }
+
     async loadConfigWithRetry() {
         let attempt = 0;
         while (true) {
             try {
                 const cfg = await fetchJsonWithTimeout('/api/config', FETCH_TIMEOUT_MS);
                 this.config = { ...DEFAULT_CONFIG, ...cfg };
-                console.log('Configuration loaded:', this.config);
+                this.applyConfigStyles();
                 return;
             } catch (error) {
                 const wait = backoffFor(attempt++);
                 console.warn(`Config load failed (${error.message}); retrying in ${wait}ms`);
-                this.showWaiting(`Waiting for server (config)...`);
-                await new Promise(r => setTimeout(r, wait));
+                this.showWaiting('Waiting for server (config)...');
+                await new Promise(resolve => setTimeout(resolve, wait));
             }
         }
     }
@@ -94,7 +89,6 @@ class Slideshow {
                 const files = await fetchJsonWithTimeout('/api/files', FETCH_TIMEOUT_MS);
                 if (Array.isArray(files) && files.length > 0) {
                     this.files = files;
-                    console.log(`Loaded ${this.files.length} files`);
                     return;
                 }
                 this.showWaiting('No media files available yet...');
@@ -103,18 +97,67 @@ class Slideshow {
                 this.showWaiting('Waiting for server (files)...');
             }
             const wait = backoffFor(attempt++);
-            await new Promise(r => setTimeout(r, wait));
+            await new Promise(resolve => setTimeout(resolve, wait));
         }
     }
 
-    // Best-effort: refresh the file list periodically. Failures are swallowed
-    // so the running slideshow is never disturbed.
-    async refreshFilesQuiet() {
+    async refreshFilesQuiet(preserveCurrentPass = false) {
         try {
-            const files = await fetchJsonWithTimeout('/api/files', FETCH_TIMEOUT_MS);
-            if (Array.isArray(files) && files.length > 0) {
-                this.files = files;
-                console.log(`Refreshed file list: ${this.files.length} files`);
+            const incoming = await fetchJsonWithTimeout('/api/files', FETCH_TIMEOUT_MS);
+            if (!Array.isArray(incoming)) {
+                return;
+            }
+
+            if (incoming.length === 0) {
+                const hadFiles = this.files.length > 0;
+                this.files = [];
+                this.currentIndex = 0;
+                if (hadFiles) {
+                    this.slideToken++;
+                    this.clearTimer();
+                    this.teardownAllContainers();
+                    this.showWaiting('No media files available yet...');
+                    this.scheduleEmptyPoll();
+                }
+                return;
+            }
+
+            if (!preserveCurrentPass || this.files.length === 0) {
+                const wasEmpty = this.files.length === 0;
+                this.files = incoming;
+                if (this.currentIndex >= this.files.length) {
+                    this.currentIndex = 0;
+                }
+                if (preserveCurrentPass && wasEmpty && !this.advancing) {
+                    this.currentIndex = 0;
+                    this.showCurrentSlide();
+                }
+                return;
+            }
+
+            const currentName = this.files[this.currentIndex]?.name;
+            const isRandom = String(this.config.displayOrder || '').toLowerCase() === 'random';
+
+            if (isRandom) {
+                // Keep the in-progress pass order while dropping deleted files and appending new ones.
+                const incomingByName = new Map(incoming.map(file => [file.name, file]));
+                const merged = this.files.filter(file => incomingByName.has(file.name));
+                const existingNames = new Set(merged.map(file => file.name));
+                for (const file of incoming) {
+                    if (!existingNames.has(file.name)) {
+                        merged.push(file);
+                    }
+                }
+                this.files = merged;
+            } else {
+                this.files = incoming;
+            }
+
+            if (currentName !== undefined) {
+                const updatedIndex = this.files.findIndex(file => file.name === currentName);
+                this.currentIndex = updatedIndex >= 0
+                    ? updatedIndex
+                    : Math.min(this.currentIndex, Math.max(0, this.files.length - 1));
             }
         } catch (error) {
             console.warn(`File refresh skipped (${error.message})`);
@@ -124,22 +167,20 @@ class Slideshow {
     startFileRefresh() {
         if (this.fileRefreshTimer) clearInterval(this.fileRefreshTimer);
         this.fileRefreshTimer = setInterval(() => {
-            this.refreshFilesQuiet();
+            this.refreshFilesQuiet(true);
         }, FILE_LIST_REFRESH_MS);
     }
 
-    // If the slideshow has not advanced in a long time, something is wedged
-    // (frozen video, dead image, lost timer). Recover by skipping forward;
-    // if that also fails repeatedly, the media-error path will reload the page.
     startWatchdog() {
         if (this.watchdogTimer) clearInterval(this.watchdogTimer);
         this.watchdogTimer = setInterval(() => {
+            if (this.files.length === 0) return;
             const maxIdle = Math.max(
                 WATCHDOG_MIN_MS,
                 (this.config.imageDuration || 5) * 1000 * WATCHDOG_MULTIPLIER,
             );
             if (Date.now() - this.lastAdvanceAt > maxIdle) {
-                console.warn('Watchdog: no slide advance detected; forcing next slide');
+                console.warn('Watchdog: no slide progress detected; advancing slide');
                 this.lastAdvanceAt = Date.now();
                 this.nextSlide().then(() => {});
             }
@@ -153,17 +194,9 @@ class Slideshow {
         }
     }
 
-    showError(message) {
-        this.hideLoading();
-        const error = document.createElement('div');
-        error.className = 'error';
-        error.innerHTML = `<div>Error: ${message}</div><div style="margin-top: 10px; font-size: 14px;">Check the console for more details</div>`;
-        document.body.appendChild(error);
-    }
-
     showWaiting(message) {
         this.hideLoading();
-        this.hideWaiting(); // Remove any existing waiting message
+        this.hideWaiting();
         const waiting = document.createElement('div');
         waiting.className = 'waiting';
         waiting.textContent = message;
@@ -187,82 +220,84 @@ class Slideshow {
     showCurrentSlide() {
         if (this.files.length === 0) return;
 
+        this.clearTimer();
+        const token = ++this.slideToken;
         const currentFile = this.files[this.currentIndex];
         const nextContainer = this.currentContainer === 0 ? 1 : 0;
         const containerElement = document.getElementById(`mediaContainer${nextContainer + 1}`);
 
-        // Clear previous content
-        containerElement.innerHTML = '';
+        this.teardownContainer(containerElement);
 
-        console.log(`Showing: ${currentFile.name} (${currentFile.type})`);
-
-        let mediaElement;
         const mediaUrl = `media/${encodeURIComponent(currentFile.name)}`;
+        let mediaElement;
 
         if (currentFile.type === 'video') {
             mediaElement = document.createElement('video');
             mediaElement.src = mediaUrl;
             mediaElement.autoplay = true;
-            mediaElement.muted = true; // Mute to allow autoplay in modern browsers
+            mediaElement.muted = true;
             mediaElement.controls = false;
-            mediaElement.style.maxWidth = '100%';
-            mediaElement.style.maxHeight = '100%';
             mediaElement.preload = 'auto';
-            mediaElement.playsInline = true; // Helps with mobile autoplay
-            mediaElement.setAttribute('playsinline', ''); // Additional mobile support
+            mediaElement.playsInline = true;
+            mediaElement.setAttribute('playsinline', '');
+
+            let lastPlaybackTime = -1;
 
             mediaElement.addEventListener('loadedmetadata', () => {
+                if (token !== this.slideToken) return;
                 this.onSlideAdvanced();
                 this.switchToContainer(nextContainer);
-                // Try to play the video explicitly
                 this.playVideo(mediaElement);
             });
 
-            // Also try to play when the video is loaded enough to start playing
             mediaElement.addEventListener('canplay', () => {
-                this.playVideo(mediaElement);
+                if (token !== this.slideToken) return;
+                if (mediaElement.paused) {
+                    this.playVideo(mediaElement);
+                }
+            });
+
+            // Refresh watchdog timestamp only while playback position advances so stalled videos still recover.
+            mediaElement.addEventListener('timeupdate', () => {
+                if (token !== this.slideToken) return;
+                if (!mediaElement.paused && !mediaElement.ended && mediaElement.currentTime !== lastPlaybackTime) {
+                    lastPlaybackTime = mediaElement.currentTime;
+                    this.lastAdvanceAt = Date.now();
+                }
             });
 
             mediaElement.addEventListener('ended', () => {
+                if (token !== this.slideToken) return;
                 this.nextSlide().then(() => {});
             });
 
-            mediaElement.addEventListener('error', (e) => {
+            mediaElement.addEventListener('error', e => {
+                if (token !== this.slideToken) return;
                 console.error('Video error:', e);
                 this.handleMediaError();
-                this.nextSlide().then(() => {
-                }); // Skip problematic video
+                this.nextSlide().then(() => {});
             });
         } else {
             mediaElement = document.createElement('img');
             mediaElement.src = mediaUrl;
-            mediaElement.style.maxWidth = '100%';
-            mediaElement.style.maxHeight = '100%';
 
-            // Only apply zoom animation if enabled in config
             if (this.config.zoomOnImage) {
-                // Set animation duration to match image duration
-                const animationDuration = `${this.config.imageDuration}s`;
-                mediaElement.style.setProperty('--zoom-duration', animationDuration);
-
-                // Alternate between zoom-in and zoom-out animations
-                if (this.currentIndex % 2 === 0) {
-                    mediaElement.classList.add('zoom-in');
-                } else {
-                    mediaElement.classList.add('zoom-out');
-                }
+                mediaElement.style.setProperty('--zoom-duration', `${this.config.imageDuration}s`);
+                mediaElement.classList.add(this.currentIndex % 2 === 0 ? 'zoom-in' : 'zoom-out');
             }
 
             mediaElement.addEventListener('load', () => {
+                if (token !== this.slideToken) return;
                 this.onSlideAdvanced();
                 this.switchToContainer(nextContainer);
-                this.scheduleNext(this.config.imageDuration * 1000);
+                this.scheduleNext(this.config.imageDuration * 1000, token);
             });
 
-            mediaElement.addEventListener('error', (e) => {
+            mediaElement.addEventListener('error', e => {
+                if (token !== this.slideToken) return;
                 console.error('Image error:', e);
                 this.handleMediaError();
-                this.nextSlide().then(() => {}); // Skip problematic image
+                this.nextSlide().then(() => {});
             });
         }
 
@@ -273,31 +308,76 @@ class Slideshow {
         try {
             await videoElement.play();
         } catch (error) {
-            console.error('Failed to autoplay video:', error);
-            // If autoplay fails, try unmuting and playing again after user interaction
-            if (error.name === 'NotAllowedError') {
-                console.log('Autoplay prevented - video is ready but requires user interaction');
+            if (error.name !== 'AbortError') {
+                console.error('Failed to autoplay video:', error);
             }
         }
     }
 
     switchToContainer(containerIndex) {
-        // Remove active class from all containers
+        const previousIndex = this.currentContainer;
+
         document.querySelectorAll('.media-container').forEach(container => {
             container.classList.remove('active');
         });
 
-        // Add active class to current container
         document.getElementById(`mediaContainer${containerIndex + 1}`).classList.add('active');
         this.currentContainer = containerIndex;
+
+        if (previousIndex >= 0 && previousIndex !== containerIndex) {
+            const outgoing = document.getElementById(`mediaContainer${previousIndex + 1}`);
+            const outgoingVideo = outgoing.querySelector('video');
+            if (outgoingVideo) {
+                outgoingVideo.pause();
+            }
+
+            if (this.cleanupTimer) {
+                clearTimeout(this.cleanupTimer);
+            }
+            const fadeMs = Math.max(0, Number(this.config.fadeTransitionDuration ?? 1) || 0) * 1000;
+            this.cleanupTimer = setTimeout(() => {
+                this.cleanupTimer = null;
+                if (this.currentContainer !== previousIndex) {
+                    this.teardownContainer(outgoing);
+                }
+            }, fadeMs + 100);
+        }
     }
 
-    scheduleNext(duration) {
-        this.clearTimer();
+    teardownContainer(container) {
+        if (!container) return;
+        const videos = container.querySelectorAll('video');
+        videos.forEach(video => {
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+        });
+        container.innerHTML = '';
+    }
 
+    teardownAllContainers() {
+        document.querySelectorAll('.media-container').forEach(container => {
+            container.classList.remove('active');
+            this.teardownContainer(container);
+        });
+        this.currentContainer = -1;
+    }
+
+    scheduleNext(duration, token) {
+        this.clearTimer();
         this.timer = setTimeout(() => {
+            if (token !== this.slideToken) return;
             this.nextSlide().then(() => {});
         }, duration);
+    }
+
+    scheduleEmptyPoll() {
+        this.clearTimer();
+        const token = this.slideToken;
+        this.timer = setTimeout(() => {
+            if (token !== this.slideToken) return;
+            this.nextSlide().then(() => {});
+        }, 5000);
     }
 
     clearTimer() {
@@ -308,21 +388,26 @@ class Slideshow {
     }
 
     async nextSlide() {
-        this.currentIndex++;
+        if (this.advancing) return;
+        this.advancing = true;
+        this.clearTimer();
 
-        if (this.currentIndex >= this.files.length) {
-            // Reached the end - try to refresh the list but never block on it.
-            console.log('End of slideshow reached, refreshing files...');
-            await this.refreshFilesQuiet();
-            this.currentIndex = 0;
-        }
+        try {
+            this.currentIndex++;
 
-        if (this.files.length > 0) {
-            this.showCurrentSlide();
-        } else {
-            // No files at all - poll quietly and resume when something arrives.
-            this.showWaiting('No media files available yet...');
-            setTimeout(() => this.nextSlide(), 5000);
+            if (this.currentIndex >= this.files.length) {
+                await this.refreshFilesQuiet(false);
+                this.currentIndex = 0;
+            }
+
+            if (this.files.length > 0) {
+                this.showCurrentSlide();
+            } else {
+                this.showWaiting('No media files available yet...');
+                this.scheduleEmptyPoll();
+            }
+        } finally {
+            this.advancing = false;
         }
     }
 
@@ -335,16 +420,12 @@ class Slideshow {
     handleMediaError() {
         this.consecutiveMediaErrors++;
         if (this.consecutiveMediaErrors >= MAX_CONSECUTIVE_MEDIA_ERRORS) {
-            console.warn(
-                `Too many consecutive media errors (${this.consecutiveMediaErrors}); reloading page`,
-            );
-            // Last-ditch recovery: full page reload re-fetches config and files.
+            console.warn(`Reloading page after ${this.consecutiveMediaErrors} consecutive media errors`);
             window.location.reload();
         }
     }
 }
 
-// Initialize slideshow when page loads
 document.addEventListener('DOMContentLoaded', () => {
     new Slideshow();
 });
