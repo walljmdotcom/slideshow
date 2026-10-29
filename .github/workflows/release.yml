@@ -3,15 +3,28 @@ name: Build and Release
 on:
   push:
     tags:
-      - 'v*'  # Triggers on tags starting with 'v' like v1.0.0
+      - 'v*'
 
-# Add permissions for the workflow
 permissions:
-  contents: write  # Required for creating releases
-  packages: write  # Optional, for package publishing
+  contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Run tests
+        run: dotnet test source/Slideshow.sln -c Release -warnaserror
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -28,79 +41,81 @@ jobs:
             folder: win-x64
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: '9.0.x'
+      - name: Setup .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '9.0.x'
 
-    - name: Restore dependencies
-      run: dotnet restore source/SlideshowWebServer.csproj
+      - name: Restore dependencies
+        run: dotnet restore source/SlideshowWebServer.csproj -r ${{ matrix.runtime }}
 
-    - name: Build and publish
-      run: |
-        dotnet publish source/SlideshowWebServer.csproj \
-          -c Release \
-          -r ${{ matrix.runtime }} \
-          --self-contained true \
-          -p:PublishSingleFile=true \
-          -o ./dist/${{ matrix.folder }}
+      - name: Build and publish
+        run: |
+          dotnet publish source/SlideshowWebServer.csproj \
+            -c Release \
+            -r ${{ matrix.runtime }} \
+            --no-restore \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -warnaserror \
+            -o ./dist/${{ matrix.folder }}
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: slideshow-${{ matrix.folder }}
-        path: ./dist/${{ matrix.folder }}
-        retention-days: 30
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: slideshow-${{ matrix.folder }}
+          path: ./dist/${{ matrix.folder }}
+          retention-days: 30
 
   create-release:
     needs: build
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: ./artifacts
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ./artifacts
 
-    - name: Organize release structure
-      run: |
-        mkdir -p dist
-        mv artifacts/slideshow-linux-x64 dist/linux-x64
-        mv artifacts/slideshow-linux-arm dist/linux-arm
-        mv artifacts/slideshow-mac-arm dist/mac-arm
-        mv artifacts/slideshow-mac-x64 dist/mac-x64
-        mv artifacts/slideshow-win-x64 dist/win-x64
+      - name: Organize release structure
+        run: |
+          mkdir -p dist
+          mv artifacts/slideshow-linux-x64 dist/linux-x64
+          mv artifacts/slideshow-linux-arm dist/linux-arm
+          mv artifacts/slideshow-mac-arm dist/mac-arm
+          mv artifacts/slideshow-mac-x64 dist/mac-x64
+          mv artifacts/slideshow-win-x64 dist/win-x64
 
-    - name: Create release archives
-      run: |
-        cd dist
-        tar --owner=root --group=root -czf ../slideshow-linux-x64.tar.gz -C linux-x64/ .
-        tar --owner=root --group=root -czf ../slideshow-linux-arm.tar.gz -C linux-arm/ .
-        tar --owner=root --group=root -czf ../slideshow-mac-arm.tar.gz -C mac-arm/ .
-        tar --owner=root --group=root -czf ../slideshow-mac-x64.tar.gz -C mac-x64/ .
-        zip -r ../slideshow-win-x64.zip win-x64/
+      - name: Create release archives
+        run: |
+          cd dist
+          tar --owner=root --group=root -czf ../slideshow-linux-x64.tar.gz -C linux-x64/ .
+          tar --owner=root --group=root -czf ../slideshow-linux-arm.tar.gz -C linux-arm/ .
+          tar --owner=root --group=root -czf ../slideshow-mac-arm.tar.gz -C mac-arm/ .
+          tar --owner=root --group=root -czf ../slideshow-mac-x64.tar.gz -C mac-x64/ .
+          zip -r ../slideshow-win-x64.zip win-x64/
 
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          slideshow-linux-x64.tar.gz
-          slideshow-linux-arm.tar.gz
-          slideshow-mac-arm.tar.gz
-          slideshow-mac-x64.tar.gz
-          slideshow-win-x64.zip
-        generate_release_notes: true
-        draft: false
-        prerelease: false
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            slideshow-linux-x64.tar.gz
+            slideshow-linux-arm.tar.gz
+            slideshow-mac-arm.tar.gz
+            slideshow-mac-x64.tar.gz
+            slideshow-win-x64.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
 
-    - name: Upload complete dist folder
-      uses: actions/upload-artifact@v4
-      with:
-        name: slideshow-all-platforms
-        path: ./dist
-        retention-days: 90
+      - name: Upload complete dist folder
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: slideshow-all-platforms
+          path: ./dist
+          retention-days: 90

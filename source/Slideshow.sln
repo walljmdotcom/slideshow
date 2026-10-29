@@ -4,6 +4,10 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SlideshowWebServer", "SlideshowWebServer.csproj", "{A1B2C3D4-E5F6-7890-ABCD-123456789ABC}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{C3D4E5F6-A7B8-4901-8CDE-3456789ABCDE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SlideshowWebServer.Tests", "..\tests\SlideshowWebServer.Tests\SlideshowWebServer.Tests.csproj", "{B2C3D4E5-F6A7-4901-BCDE-23456789ABCD}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -14,9 +18,12 @@ Global
 		{A1B2C3D4-E5F6-7890-ABCD-123456789ABC}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A1B2C3D4-E5F6-7890-ABCD-123456789ABC}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A1B2C3D4-E5F6-7890-ABCD-123456789ABC}.Release|Any CPU.Build.0 = Release|Any CPU
-		{B2C3D4E5-F6G7-8901-BCDE-23456789ABCD}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{B2C3D4E5-F6G7-8901-BCDE-23456789ABCD}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{B2C3D4E5-F6G7-8901-BCDE-23456789ABCD}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{B2C3D4E5-F6G7-8901-BCDE-23456789ABCD}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B2C3D4E5-F6A7-4901-BCDE-23456789ABCD}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B2C3D4E5-F6A7-4901-BCDE-23456789ABCD}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B2C3D4E5-F6A7-4901-BCDE-23456789ABCD}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B2C3D4E5-F6A7-4901-BCDE-23456789ABCD}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{B2C3D4E5-F6A7-4901-BCDE-23456789ABCD} = {C3D4E5F6-A7B8-4901-8CDE-3456789ABCDE}
 	EndGlobalSection
 EndGlobal
