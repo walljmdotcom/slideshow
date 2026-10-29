@@ -1,7 +1,7 @@
 [Unit]
 Description=Walljm Slideshow Server
-StartLimitInterval=200
-StartLimitBurst=5
+After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 DynamicUser=yes
@@ -10,7 +10,7 @@ WorkingDirectory=/opt/walljm/slideshow
 ExecStart=/opt/walljm/slideshow/SlideshowWebServer
 Type=notify
 Restart=always
-RestartSec=15
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

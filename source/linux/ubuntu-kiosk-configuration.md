@@ -33,6 +33,13 @@ sudo cp ./linux/slideshow.service /etc/systemd/system/
 sudo cp ./linux/kiosk.service /etc/systemd/system/
 ```
 
+Order WPE WebKit after `slideshow.service` so cold boots wait for `Type=notify` (`localhost:5500` bound) before opening the browser:
+
+```bash
+sudo mkdir -p /etc/systemd/system/snap.wpe-webkit-mir-kiosk.daemon.service.d
+printf '[Unit]\nWants=slideshow.service\nAfter=slideshow.service\n' | sudo tee /etc/systemd/system/snap.wpe-webkit-mir-kiosk.daemon.service.d/slideshow.conf >/dev/null
+```
+
 Edit `/opt/walljm/slideshow/config.json` and set `folderPath` to your local media directory (or `/opt/walljm/slideshow/imgs` when using the SMB automount below). `slideshow.service` sets `CacheDirectory=slideshow`, so the service stores its local media cache under `/var/cache/slideshow`.
 
 Enable and start both services:

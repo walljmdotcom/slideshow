@@ -1,1 +1,1 @@
-/opt/walljm/slideshow/imgs -fstype=cifs,ro,credentials=/etc/slideshow-smb-credentials,dir_mode=0755,file_mode=0644 ://<ip_of_server>/path/to/photo/folder
+/opt/walljm/slideshow/imgs -fstype=cifs,ro,soft,echo_interval=10,actimeo=5,credentials=/etc/slideshow-smb-credentials,dir_mode=0755,file_mode=0644 ://<ip_of_server>/path/to/photo/folder
