@@ -12,6 +12,20 @@ const WATCHDOG_MULTIPLIER = 4;
 const WATCHDOG_MIN_MS = 20 * 1000;
 const MAX_CONSECUTIVE_MEDIA_ERRORS = 25;
 
+async function fetchWithTimeout(url, options, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(url, { ...options, signal: controller.signal, cache: 'no-store' });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        return response;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function fetchJsonWithTimeout(url, timeoutMs) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -31,6 +45,13 @@ function backoffFor(attempt) {
     return RETRY_BACKOFF_MS[index];
 }
 
+function mediaErrorDelayFor(errorCount) {
+    if (errorCount <= 2) return 0;
+    if (errorCount <= 5) return 1000;
+    if (errorCount <= 10) return 2500;
+    return 5000;
+}
+
 class Slideshow {
     constructor() {
         this.files = [];
@@ -40,6 +61,8 @@ class Slideshow {
         this.currentContainer = -1;
         this.slideToken = 0;
         this.advancing = false;
+        this.recovering = false;
+        this.refreshInFlight = null;
         this.config = { ...DEFAULT_CONFIG };
         this.lastAdvanceAt = Date.now();
         this.consecutiveMediaErrors = 0;
@@ -60,9 +83,12 @@ class Slideshow {
         this.startWatchdog();
     }
 
+    fadeDurationSeconds() {
+        return Math.max(0, Number(this.config.fadeTransitionDuration ?? 1) || 0);
+    }
+
     applyConfigStyles() {
-        const fadeSeconds = Math.max(0, Number(this.config.fadeTransitionDuration ?? 1) || 0);
-        document.documentElement.style.setProperty('--fade-duration', `${fadeSeconds}s`);
+        document.documentElement.style.setProperty('--fade-duration', `${this.fadeDurationSeconds()}s`);
     }
 
     async loadConfigWithRetry() {
@@ -102,6 +128,25 @@ class Slideshow {
     }
 
     async refreshFilesQuiet(preserveCurrentPass = false) {
+        if (this.refreshInFlight) {
+            if (preserveCurrentPass) {
+                return this.refreshInFlight;
+            }
+            await this.refreshInFlight;
+        }
+
+        const task = this.performFileRefresh(preserveCurrentPass);
+        this.refreshInFlight = task;
+        try {
+            await task;
+        } finally {
+            if (this.refreshInFlight === task) {
+                this.refreshInFlight = null;
+            }
+        }
+    }
+
+    async performFileRefresh(preserveCurrentPass) {
         try {
             const incoming = await fetchJsonWithTimeout('/api/files', FETCH_TIMEOUT_MS);
             if (!Array.isArray(incoming)) {
@@ -125,23 +170,31 @@ class Slideshow {
             if (!preserveCurrentPass || this.files.length === 0) {
                 const wasEmpty = this.files.length === 0;
                 this.files = incoming;
-                if (this.currentIndex >= this.files.length) {
+                if (this.currentIndex >= this.files.length || this.currentIndex < 0) {
                     this.currentIndex = 0;
                 }
-                if (preserveCurrentPass && wasEmpty && !this.advancing) {
+                if (preserveCurrentPass && wasEmpty && !this.advancing && !this.recovering) {
                     this.currentIndex = 0;
                     this.showCurrentSlide();
                 }
                 return;
             }
 
-            const currentName = this.files[this.currentIndex]?.name;
+            const previousList = this.files;
+            const previousIndex = this.currentIndex;
+            const currentName = previousIndex >= 0 ? previousList[previousIndex]?.name : undefined;
             const isRandom = String(this.config.displayOrder || '').toLowerCase() === 'random';
 
             if (isRandom) {
-                // Keep the in-progress pass order while dropping deleted files and appending new ones.
+                // Keep the in-progress pass order while picking up updated versions and appending new files.
                 const incomingByName = new Map(incoming.map(file => [file.name, file]));
-                const merged = this.files.filter(file => incomingByName.has(file.name));
+                const merged = [];
+                for (const file of previousList) {
+                    const refreshed = incomingByName.get(file.name);
+                    if (refreshed) {
+                        merged.push(refreshed);
+                    }
+                }
                 const existingNames = new Set(merged.map(file => file.name));
                 for (const file of incoming) {
                     if (!existingNames.has(file.name)) {
@@ -153,11 +206,28 @@ class Slideshow {
                 this.files = incoming;
             }
 
+            if (previousIndex < 0) {
+                this.currentIndex = -1;
+                return;
+            }
+
             if (currentName !== undefined) {
                 const updatedIndex = this.files.findIndex(file => file.name === currentName);
-                this.currentIndex = updatedIndex >= 0
-                    ? updatedIndex
-                    : Math.min(this.currentIndex, Math.max(0, this.files.length - 1));
+                if (updatedIndex >= 0) {
+                    this.currentIndex = updatedIndex;
+                    return;
+                }
+
+                // Step back one slot before the next surviving slide so nextSlide()'s increment lands on it.
+                let nextSurvivingIndex = -1;
+                for (let i = previousIndex + 1; i < previousList.length; i++) {
+                    const idx = this.files.findIndex(file => file.name === previousList[i].name);
+                    if (idx >= 0) {
+                        nextSurvivingIndex = idx;
+                        break;
+                    }
+                }
+                this.currentIndex = nextSurvivingIndex >= 0 ? nextSurvivingIndex - 1 : this.files.length - 1;
             }
         } catch (error) {
             console.warn(`File refresh skipped (${error.message})`);
@@ -174,7 +244,7 @@ class Slideshow {
     startWatchdog() {
         if (this.watchdogTimer) clearInterval(this.watchdogTimer);
         this.watchdogTimer = setInterval(() => {
-            if (this.files.length === 0) return;
+            if (this.files.length === 0 || this.recovering) return;
             const maxIdle = Math.max(
                 WATCHDOG_MIN_MS,
                 (this.config.imageDuration || 5) * 1000 * WATCHDOG_MULTIPLIER,
@@ -221,96 +291,127 @@ class Slideshow {
         if (this.files.length === 0) return;
 
         this.clearTimer();
+        this.clearCleanupTimer();
         const token = ++this.slideToken;
-        const currentFile = this.files[this.currentIndex];
+        const slideIndex = this.currentIndex;
+        const currentFile = this.files[slideIndex];
         const nextContainer = this.currentContainer === 0 ? 1 : 0;
         const containerElement = document.getElementById(`mediaContainer${nextContainer + 1}`);
 
         this.teardownContainer(containerElement);
 
-        const mediaUrl = `media/${encodeURIComponent(currentFile.name)}`;
-        let mediaElement;
+        const versionQuery = currentFile.version ? `?v=${encodeURIComponent(currentFile.version)}` : '';
+        const mediaUrl = `media/${encodeURIComponent(currentFile.name)}${versionQuery}`;
 
         if (currentFile.type === 'video') {
-            mediaElement = document.createElement('video');
-            mediaElement.src = mediaUrl;
-            mediaElement.autoplay = true;
-            mediaElement.muted = true;
-            mediaElement.controls = false;
-            mediaElement.preload = 'auto';
-            mediaElement.playsInline = true;
-            mediaElement.setAttribute('playsinline', '');
+            const videoElement = document.createElement('video');
+            videoElement.autoplay = true;
+            videoElement.muted = true;
+            videoElement.defaultMuted = true;
+            videoElement.controls = false;
+            videoElement.preload = 'auto';
+            videoElement.playsInline = true;
+            videoElement.setAttribute('muted', '');
+            videoElement.setAttribute('playsinline', '');
 
             let lastPlaybackTime = -1;
+            let revealed = false;
 
-            mediaElement.addEventListener('loadedmetadata', () => {
-                if (token !== this.slideToken) return;
+            const revealVideo = () => {
+                if (revealed || token !== this.slideToken) return;
+                revealed = true;
                 this.onSlideAdvanced();
                 this.switchToContainer(nextContainer);
-                this.playVideo(mediaElement);
+            };
+
+            videoElement.addEventListener('loadedmetadata', () => {
+                if (token !== this.slideToken) return;
+                this.playVideo(videoElement, token);
             });
 
-            mediaElement.addEventListener('canplay', () => {
+            videoElement.addEventListener('loadeddata', revealVideo);
+            videoElement.addEventListener('playing', revealVideo);
+
+            videoElement.addEventListener('canplay', () => {
                 if (token !== this.slideToken) return;
-                if (mediaElement.paused) {
-                    this.playVideo(mediaElement);
+                if (videoElement.paused) {
+                    this.playVideo(videoElement, token);
                 }
             });
 
             // Refresh watchdog timestamp only while playback position advances so stalled videos still recover.
-            mediaElement.addEventListener('timeupdate', () => {
+            videoElement.addEventListener('timeupdate', () => {
                 if (token !== this.slideToken) return;
-                if (!mediaElement.paused && !mediaElement.ended && mediaElement.currentTime !== lastPlaybackTime) {
-                    lastPlaybackTime = mediaElement.currentTime;
+                if (!videoElement.paused && !videoElement.ended && videoElement.currentTime !== lastPlaybackTime) {
+                    lastPlaybackTime = videoElement.currentTime;
                     this.lastAdvanceAt = Date.now();
                 }
             });
 
-            mediaElement.addEventListener('ended', () => {
+            videoElement.addEventListener('ended', () => {
                 if (token !== this.slideToken) return;
                 this.nextSlide().then(() => {});
             });
 
-            mediaElement.addEventListener('error', e => {
+            videoElement.addEventListener('error', e => {
                 if (token !== this.slideToken) return;
                 console.error('Video error:', e);
-                this.handleMediaError();
-                this.nextSlide().then(() => {});
+                this.onMediaError(token);
             });
+
+            videoElement.src = mediaUrl;
+            containerElement.appendChild(videoElement);
         } else {
-            mediaElement = document.createElement('img');
-            mediaElement.src = mediaUrl;
+            const imageElement = document.createElement('img');
+            const zoomClass = slideIndex % 2 === 0 ? 'zoom-in' : 'zoom-out';
 
-            if (this.config.zoomOnImage) {
-                mediaElement.style.setProperty('--zoom-duration', `${this.config.imageDuration}s`);
-                mediaElement.classList.add(this.currentIndex % 2 === 0 ? 'zoom-in' : 'zoom-out');
-            }
-
-            mediaElement.addEventListener('load', () => {
+            imageElement.addEventListener('load', async () => {
                 if (token !== this.slideToken) return;
+
+                if (typeof imageElement.decode === 'function') {
+                    try {
+                        await imageElement.decode();
+                    } catch {
+                        if (!imageElement.complete || imageElement.naturalWidth === 0) {
+                            if (token === this.slideToken) {
+                                this.onMediaError(token);
+                            }
+                            return;
+                        }
+                    }
+                    if (token !== this.slideToken) return;
+                }
+
                 this.onSlideAdvanced();
+                if (this.config.zoomOnImage) {
+                    const durationSeconds = (this.config.imageDuration || 5) + this.fadeDurationSeconds();
+                    imageElement.style.setProperty('--zoom-duration', `${durationSeconds}s`);
+                    imageElement.classList.add(zoomClass);
+                }
                 this.switchToContainer(nextContainer);
-                this.scheduleNext(this.config.imageDuration * 1000, token);
+                this.scheduleNext((this.config.imageDuration || 5) * 1000, token);
             });
 
-            mediaElement.addEventListener('error', e => {
+            imageElement.addEventListener('error', e => {
                 if (token !== this.slideToken) return;
                 console.error('Image error:', e);
-                this.handleMediaError();
-                this.nextSlide().then(() => {});
+                this.onMediaError(token);
             });
-        }
 
-        containerElement.appendChild(mediaElement);
+            imageElement.src = mediaUrl;
+            containerElement.appendChild(imageElement);
+        }
     }
 
-    async playVideo(videoElement) {
+    async playVideo(videoElement, token) {
         try {
             await videoElement.play();
         } catch (error) {
-            if (error.name !== 'AbortError') {
-                console.error('Failed to autoplay video:', error);
+            if (token !== this.slideToken || error.name === 'AbortError') {
+                return;
             }
+            console.error('Failed to autoplay video:', error);
+            this.onMediaError(token);
         }
     }
 
@@ -331,10 +432,8 @@ class Slideshow {
                 outgoingVideo.pause();
             }
 
-            if (this.cleanupTimer) {
-                clearTimeout(this.cleanupTimer);
-            }
-            const fadeMs = Math.max(0, Number(this.config.fadeTransitionDuration ?? 1) || 0) * 1000;
+            this.clearCleanupTimer();
+            const fadeMs = this.fadeDurationSeconds() * 1000;
             this.cleanupTimer = setTimeout(() => {
                 this.cleanupTimer = null;
                 if (this.currentContainer !== previousIndex) {
@@ -356,6 +455,7 @@ class Slideshow {
     }
 
     teardownAllContainers() {
+        this.clearCleanupTimer();
         document.querySelectorAll('.media-container').forEach(container => {
             container.classList.remove('active');
             this.teardownContainer(container);
@@ -387,15 +487,22 @@ class Slideshow {
         }
     }
 
+    clearCleanupTimer() {
+        if (this.cleanupTimer) {
+            clearTimeout(this.cleanupTimer);
+            this.cleanupTimer = null;
+        }
+    }
+
     async nextSlide() {
-        if (this.advancing) return;
+        if (this.advancing || this.recovering) return;
         this.advancing = true;
         this.clearTimer();
 
         try {
             this.currentIndex++;
 
-            if (this.currentIndex >= this.files.length) {
+            if (this.currentIndex >= this.files.length || this.currentIndex < 0) {
                 await this.refreshFilesQuiet(false);
                 this.currentIndex = 0;
             }
@@ -417,11 +524,59 @@ class Slideshow {
         this.hideWaiting();
     }
 
-    handleMediaError() {
+    onMediaError(token) {
         this.consecutiveMediaErrors++;
         if (this.consecutiveMediaErrors >= MAX_CONSECUTIVE_MEDIA_ERRORS) {
-            console.warn(`Reloading page after ${this.consecutiveMediaErrors} consecutive media errors`);
-            window.location.reload();
+            this.recoverFromMediaErrors(token).then(() => {});
+            return;
+        }
+
+        const delayMs = mediaErrorDelayFor(this.consecutiveMediaErrors);
+        this.lastAdvanceAt = Date.now();
+        this.scheduleNext(delayMs, token);
+    }
+
+    async recoverFromMediaErrors(token) {
+        if (this.recovering || token !== this.slideToken) return;
+        this.recovering = true;
+        this.clearTimer();
+
+        try {
+            // Probe the server before reloading so a restart never strands the browser on an error page.
+            try {
+                await fetchWithTimeout('/', { method: 'HEAD' }, 5000);
+                console.warn(`Server reachable after ${this.consecutiveMediaErrors} media errors; reloading page`);
+                window.location.reload();
+                return;
+            } catch {
+                console.warn('Server unreachable after media errors; keeping last slide until server responds');
+            }
+
+            let attempt = 0;
+            while (token === this.slideToken) {
+                this.lastAdvanceAt = Date.now();
+                const wait = backoffFor(attempt++);
+                await new Promise(resolve => setTimeout(resolve, wait));
+                if (token !== this.slideToken) return;
+
+                try {
+                    const cfg = await fetchJsonWithTimeout('/api/config', FETCH_TIMEOUT_MS);
+                    this.config = { ...DEFAULT_CONFIG, ...cfg };
+                    this.applyConfigStyles();
+                    await this.refreshFilesQuiet(false);
+                    this.consecutiveMediaErrors = 0;
+                    this.lastAdvanceAt = Date.now();
+                    break;
+                } catch {
+                    // Server is still restarting; stay on the currently displayed slide.
+                }
+            }
+        } finally {
+            this.recovering = false;
+        }
+
+        if (token === this.slideToken) {
+            await this.nextSlide();
         }
     }
 }
