@@ -569,3 +569,6 @@ MigrationBackup/
 # End of https://www.toptal.com/developers/gitignore/api/windows,macos,linux,visualstudio,visualstudiocode,dotnetcore,aspnetcore,angular
 
 dist/
+
+# Six Labors license key. CI reads it from the SIXLABORS_LICENSE_KEY secret.
+sixlabors.lic
