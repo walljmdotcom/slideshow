@@ -18,6 +18,10 @@ public sealed class SlideshowConfig
     public bool ZoomOnImage { get; set; } = true;
     public string DisplayOrder { get; set; } = AlphabeticalDisplayOrder;
     public bool AllowEmptySourceSync { get; set; }
+    public int MaxImageWidth { get; set; }
+    public int MaxImageHeight { get; set; }
+
+    internal ImageBounds ImageBounds => new(this.MaxImageWidth, this.MaxImageHeight);
 
     public static SlideshowConfig FromConfiguration(IConfiguration configuration)
     {
@@ -66,6 +70,16 @@ public sealed class SlideshowConfig
         if (bool.TryParse(configuration["allowEmptySourceSync"], out bool allowEmpty))
         {
             config.AllowEmptySourceSync = allowEmpty;
+        }
+
+        if (int.TryParse(configuration["maxImageWidth"], out int maxImageWidth) && maxImageWidth >= 0)
+        {
+            config.MaxImageWidth = maxImageWidth;
+        }
+
+        if (int.TryParse(configuration["maxImageHeight"], out int maxImageHeight) && maxImageHeight >= 0)
+        {
+            config.MaxImageHeight = maxImageHeight;
         }
 
         return config;

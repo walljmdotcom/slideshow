@@ -45,6 +45,7 @@ Relative paths in `config.json` resolve relative to `AppContext.BaseDirectory`.
 - `zoomOnImage`: Enables a subtle zoom animation on images.
 - `displayOrder`: `"Alpha"` for alphabetical order or `"Random"` for shuffled playback.
 - `allowEmptySourceSync`: Optional boolean (default `false`). When `false`, an empty source directory does not delete existing cached slides so an unmounted share cannot wipe playback.
+- `maxImageWidth`, `maxImageHeight`: Optional pixel limits for cached images (default `0`, which leaves that axis unbounded; both `0` turns resizing off). Set them to the screen resolution, such as `1920` and `1080`, so the browser decodes screen-sized images instead of full camera files. JPEG, PNG, WebP, and BMP images larger than the limits are scaled down in the cache with their aspect ratio kept, rotated upright per EXIF orientation, and stripped of EXIF, XMP, and IPTC metadata (including GPS location). Source files are never modified. GIF, SVG, and video files are cached unchanged. An image that cannot be decoded is cached as-is. Changing either limit re-processes every image on the next sync.
 
 ### Command Line and Environment Overrides
 
@@ -95,6 +96,8 @@ chmod +x SlideshowWebServer
 ```
 
 ### Publishing and Testing from Source
+
+Release builds need a Six Labors community license key for ImageSharp. Locally, save the key file as `source/sixlabors.lic`, which git ignores. CI reads the same key from the `SIXLABORS_LICENSE_KEY` repository secret. Keys expire, and renewal opens 90 days before expiry at https://licensing.sixlabors.com/. Debug builds only warn when the key is missing or expired.
 
 Run the unit and integration test suite:
 

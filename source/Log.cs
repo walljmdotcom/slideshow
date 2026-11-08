@@ -143,4 +143,25 @@ internal static partial class Log
         Message = "Failed to stat source file {Name}; keeping any cached copy"
     )]
     public static partial void SourceEntryStatFailed(ILogger logger, Exception exception, string name);
+
+    [LoggerMessage(
+        EventId = 19,
+        Level = LogLevel.Warning,
+        Message = "Could not resize {Name}; caching the original"
+    )]
+    public static partial void ImageResizeFailed(ILogger logger, Exception exception, string name);
+
+    [LoggerMessage(
+        EventId = 20,
+        Level = LogLevel.Warning,
+        Message = "Could not write the image cache manifest in {CacheFolderPath}; images will be re-processed"
+    )]
+    public static partial void ImageManifestWriteFailed(ILogger logger, Exception exception, string cacheFolderPath);
+
+    [LoggerMessage(
+        EventId = 21,
+        Level = LogLevel.Information,
+        Message = "Cached images are resized to fit {MaxWidth}x{MaxHeight} (0 = unbounded)"
+    )]
+    public static partial void ImageResizeEnabled(ILogger logger, int maxWidth, int maxHeight);
 }
