@@ -1,6 +1,6 @@
 # Slideshow Web Server
 
-A self-contained .NET 9 web application that displays images and videos in a browser from a local directory or SMB share, mirrored into a local disk cache so network hiccups never stall playback.
+A self-contained .NET 10 web application that displays images and videos in a browser from a local directory or SMB share, mirrored into a local disk cache so network hiccups never stall playback.
 
 - [Features](#features)
 - [Configuration](#configuration)
