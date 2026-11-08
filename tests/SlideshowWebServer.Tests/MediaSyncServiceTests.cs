@@ -211,15 +211,18 @@ public sealed class MediaSyncServiceTests
             )
         );
 
-        await using DripStream progressing = new(chunkCount: 4, delayBetweenChunksMs: 35);
+        // The whole copy outlasts the timeout, so it only completes if every chunk resets the stall timer.
+        // Each gap is far below the timeout so a loaded CI runner cannot stretch one past it.
+        const int chunkCount = 24;
+        await using DripStream progressing = new(chunkCount, delayBetweenChunksMs: 25);
         using MemoryStream completed = new();
         await MediaSyncService.CopyStreamWithTimeoutAsync(
             progressing,
             completed,
-            TimeSpan.FromMilliseconds(150),
+            TimeSpan.FromMilliseconds(400),
             CancellationToken.None
         );
-        Assert.Equal([1, 2, 3, 4], completed.ToArray());
+        Assert.Equal(Enumerable.Range(1, chunkCount).Select(static i => (byte)i), completed.ToArray());
     }
 
     internal static (MediaService Media, MediaSyncService Sync) CreateServices(
