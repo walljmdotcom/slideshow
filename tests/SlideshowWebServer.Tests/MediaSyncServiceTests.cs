@@ -222,9 +222,10 @@ public sealed class MediaSyncServiceTests
         Assert.Equal([1, 2, 3, 4], completed.ToArray());
     }
 
-    private static (MediaService Media, MediaSyncService Sync) CreateServices(
+    internal static (MediaService Media, MediaSyncService Sync) CreateServices(
         TempWorkspace workspace,
-        bool allowEmptySourceSync = false
+        bool allowEmptySourceSync = false,
+        ImageBounds imageBounds = default
     )
     {
         SlideshowConfig config = new()
@@ -232,6 +233,8 @@ public sealed class MediaSyncServiceTests
             FolderPath = workspace.SourcePath,
             CacheFolderPath = workspace.CachePath,
             AllowEmptySourceSync = allowEmptySourceSync,
+            MaxImageWidth = imageBounds.MaxWidth,
+            MaxImageHeight = imageBounds.MaxHeight,
         };
         MediaService mediaService = new(config, NullLogger<MediaService>.Instance, workspace.RootPath);
         MediaSyncService syncService = new(NullLogger<MediaSyncService>.Instance, mediaService);

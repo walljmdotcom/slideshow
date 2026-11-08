@@ -11,6 +11,8 @@ internal readonly record struct SourceMediaEntry(
     DateTime LastWriteTimeUtc
 );
 
+internal readonly record struct SyncResult(int Copied, int Skipped, int Removed, int Failed);
+
 internal sealed class MediaSyncService : BackgroundService
 {
     private const int CopyBufferSize = 81920;
@@ -50,6 +52,12 @@ internal sealed class MediaSyncService : BackgroundService
             interval.TotalSeconds
         );
 
+        ImageBounds bounds = this.mediaService.Config.ImageBounds;
+        if (bounds.IsEnabled)
+        {
+            Log.ImageResizeEnabled(this.logger, bounds.MaxWidth, bounds.MaxHeight);
+        }
+
         _ = this.mediaService.RefreshCacheIndex();
 
         await this.RunSafeSyncIterationAsync(stoppingToken);
@@ -82,10 +90,11 @@ internal sealed class MediaSyncService : BackgroundService
         }
     }
 
-    internal async Task SyncOnceAsync(CancellationToken cancellationToken)
+    internal async Task<SyncResult> SyncOnceAsync(CancellationToken cancellationToken)
     {
         string source = this.mediaService.SourceFolderPath;
         string cache = this.mediaService.CacheFolderPath;
+        ImageBounds bounds = this.mediaService.Config.ImageBounds;
 
         try
         {
@@ -94,7 +103,7 @@ internal sealed class MediaSyncService : BackgroundService
         catch (Exception ex)
         {
             Log.CacheDirectoryFailed(this.logger, ex, cache);
-            return;
+            return default;
         }
 
         HashSet<string> seenSourceOrdinal = new(StringComparer.Ordinal);
@@ -108,7 +117,7 @@ internal sealed class MediaSyncService : BackgroundService
             if (!sourceDir.Exists)
             {
                 Log.SourceUnavailable(this.logger, source);
-                return;
+                return default;
             }
 
             foreach (FileInfo entry in sourceDir.EnumerateFiles())
@@ -149,7 +158,7 @@ internal sealed class MediaSyncService : BackgroundService
         catch (Exception ex)
         {
             Log.SourceProbeFailed(this.logger, ex, source);
-            return;
+            return default;
         }
 
         Dictionary<string, FileInfo> cacheByOrdinal = new(StringComparer.Ordinal);
@@ -161,6 +170,11 @@ internal sealed class MediaSyncService : BackgroundService
                 continue;
             }
 
+            if (string.Equals(entry.Name, ImageCacheManifest.FileName, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
             cacheByOrdinal[entry.Name] = entry;
         }
 
@@ -168,8 +182,12 @@ internal sealed class MediaSyncService : BackgroundService
         if (seenSourceOrdinal.Count == 0 && cacheByOrdinal.Count > 0 && !this.mediaService.Config.AllowEmptySourceSync)
         {
             Log.SourceEmptyKeepingCache(this.logger, source, cacheByOrdinal.Count);
-            return;
+            return default;
         }
+
+        ImageCacheManifest? manifest = bounds.IsEnabled
+            ? await ImageCacheManifest.LoadAsync(cache, cancellationToken)
+            : null;
 
         int removed = 0;
         List<string> deferredCaseRenames = [];
@@ -200,7 +218,7 @@ internal sealed class MediaSyncService : BackgroundService
         foreach (SourceMediaEntry srcEntry in readableSources)
         {
             if (cacheByOrdinal.TryGetValue(srcEntry.Name, out FileInfo? cachedInfo)
-                && IsUnchanged(cachedInfo, srcEntry))
+                && IsCacheCurrent(cachedInfo, srcEntry, manifest, bounds))
             {
                 skipped++;
                 continue;
@@ -219,7 +237,13 @@ internal sealed class MediaSyncService : BackgroundService
 
             try
             {
-                await this.CopyAtomicAsync(srcEntry, Path.Combine(cache, srcEntry.Name), cancellationToken);
+                await this.CopyAtomicAsync(
+                    srcEntry,
+                    Path.Combine(cache, srcEntry.Name),
+                    manifest,
+                    bounds,
+                    cancellationToken
+                );
                 copied++;
 
                 if (!this.mediaService.HasCachedFiles)
@@ -263,7 +287,26 @@ internal sealed class MediaSyncService : BackgroundService
             _ = this.mediaService.RefreshCacheIndex();
         }
 
+        if (manifest is not null)
+        {
+            manifest.RetainOnly(seenSourceOrdinal);
+            try
+            {
+                await manifest.SaveIfChangedAsync(cancellationToken);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Log.ImageManifestWriteFailed(this.logger, ex, cache);
+            }
+
+            if (copied > 0)
+            {
+                ImageResizer.ReleaseRetainedMemory();
+            }
+        }
+
         Log.SyncCompleted(this.logger, copied, skipped, removed, failed, seenSourceOrdinal.Count);
+        return new SyncResult(copied, skipped, removed, failed);
     }
 
     internal static async Task CopyStreamWithTimeoutAsync(
@@ -308,10 +351,20 @@ internal sealed class MediaSyncService : BackgroundService
         }
     }
 
-    private static bool IsUnchanged(FileInfo cached, SourceMediaEntry source)
+    private static bool IsCacheCurrent(
+        FileInfo cached,
+        SourceMediaEntry source,
+        ImageCacheManifest? manifest,
+        ImageBounds bounds
+    )
     {
         try
         {
+            if (manifest is not null && ImageResizer.CanResize(source.Name))
+            {
+                return manifest.IsCurrent(source.Name, source, bounds, cached.Length);
+            }
+
             return cached.Length == source.Length
                 && Math.Abs((cached.LastWriteTimeUtc - source.LastWriteTimeUtc).Ticks) < TimeSpan.TicksPerMillisecond;
         }
@@ -339,10 +392,13 @@ internal sealed class MediaSyncService : BackgroundService
     private async Task CopyAtomicAsync(
         SourceMediaEntry source,
         string destinationPath,
+        ImageCacheManifest? manifest,
+        ImageBounds bounds,
         CancellationToken cancellationToken
     )
     {
         string tempPath = destinationPath + ".tmp";
+        string resizedPath = destinationPath + ".resized.tmp";
 
         try
         {
@@ -369,21 +425,63 @@ internal sealed class MediaSyncService : BackgroundService
                 await CopyStreamWithTimeoutAsync(src, dst, this.readStallTimeout, cancellationToken);
             }
 
+            bool resizable = manifest is not null && ImageResizer.CanResize(source.Name);
+            string publishPath = resizable
+                ? await this.ResizeOrKeepOriginalAsync(tempPath, resizedPath, source.Name, bounds, cancellationToken)
+                : tempPath;
+
             try
             {
-                File.SetLastWriteTimeUtc(tempPath, source.LastWriteTimeUtc);
+                File.SetLastWriteTimeUtc(publishPath, source.LastWriteTimeUtc);
             }
             catch
             {
             }
 
-            MoveIntoPlace(tempPath, destinationPath);
+            MoveIntoPlace(publishPath, destinationPath);
+            TryDeleteBestEffort(tempPath);
+
+            if (resizable)
+            {
+                manifest?.Record(source.Name, source, bounds, new FileInfo(destinationPath).Length);
+            }
         }
         catch
         {
             TryDeleteBestEffort(tempPath);
+            TryDeleteBestEffort(resizedPath);
             throw;
         }
+    }
+
+    /// <summary>The path to publish: the resized copy, or the original when it fits or fails to decode.</summary>
+    private async Task<string> ResizeOrKeepOriginalAsync(
+        string originalPath,
+        string resizedPath,
+        string mediaName,
+        ImageBounds bounds,
+        CancellationToken cancellationToken
+    )
+    {
+        try
+        {
+            if (await ImageResizer.TryResizeAsync(originalPath, mediaName, resizedPath, bounds, cancellationToken))
+            {
+                return resizedPath;
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // The browser may still render a file the decoder rejects, so the original is a better slide than none.
+            Log.ImageResizeFailed(this.logger, ex, mediaName);
+            TryDeleteBestEffort(resizedPath);
+        }
+
+        return originalPath;
     }
 
     private static void MoveIntoPlace(string tempPath, string destinationPath)
